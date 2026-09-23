@@ -1,0 +1,43 @@
+appId: com.dsh.launcher
+productName: DSH Launcher
+directories:
+  output: release
+  buildResources: build
+files:
+  - out/**
+  - resources/**
+  - package.json
+  # Type definitions pulled in by extract-zip are useless at runtime.
+  - "!node_modules/@types/**"
+  - "!node_modules/undici-types/**"
+# No native modules: the managed Node.js runtime is downloaded at runtime, not bundled.
+npmRebuild: false
+win:
+  icon: build/icon.png
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: DSH Launcher
+  artifactName: dsh-launcher-${version}-setup.${ext}
+portable:
+  # One self-contained exe: it unpacks to a temp folder and keeps its data in
+  # dsh-launcher-data next to the exe itself.
+  artifactName: dsh-launcher-${version}-portable.${ext}
+  requestExecutionLevel: user
+  unicode: true
+
+mac:
+  icon: build/icon.png
+  category: public.app-category.developer-tools
+  target: [dmg]
+linux:
+  icon: build/icon.png
+  category: Development
+  target: [AppImage]

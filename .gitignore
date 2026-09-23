@@ -1,0 +1,10 @@
+node_modules/
+out/
+dist/
+release/
+*.log
+.vite/
+coverage/
+.e2e/
+# Promo video工作目录：144MB 的抓帧缓存、音轨与打包工具，不属于源码
+promo/
