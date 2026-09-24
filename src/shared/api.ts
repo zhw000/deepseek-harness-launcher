@@ -1,6 +1,7 @@
 import type {
   AppState, LauncherEvent, LogLine, MarketPage, PackagePreview, PluginUpdate,
   ProfileDetail, ProfileSummary, SettingsPatch, PluginUpdateCheck, MarketQuery,
+  DoctorReport, ImportResult, LauncherRelease, MirrorTiming,
 } from './types'
 
 export type OpenTarget = 'root' | 'dshHome' | 'dshLogs' | 'logs' | 'workspace' | 'profile'
@@ -41,6 +42,17 @@ export interface LauncherApi {
   refreshMarketIndex(): Promise<void>
   previewPackage(spec: string): Promise<PackagePreview>
 
+  /** Check GitHub for a newer launcher release. */
+  checkLauncherUpdate(): Promise<LauncherRelease | null>
+  /** Run every health check and report what is wrong and where to fix it. */
+  runDoctor(): Promise<DoctorReport>
+  /** Measure each download source from this machine. */
+  testMirrors(): Promise<MirrorTiming[]>
+  /** Save the plugin list of a profile to a file the user picks; resolves to the path, or null if cancelled. */
+  exportPlugins(profile: string): Promise<string | null>
+  /** Install the plugins listed in a file the user picks; null if cancelled. */
+  importPlugins(profile: string): Promise<ImportResult | null>
+
   updateSettings(patch: SettingsPatch): Promise<void>
   cancelTask(id: string): Promise<void>
   pickDirectory(initial?: string): Promise<string | null>
@@ -59,6 +71,7 @@ export const API_METHODS = [
   'listProfiles', 'createProfile', 'getProfile', 'checkPluginUpdates', 'installPlugin', 'removePlugin',
   'updatePlugins', 'setBundleEnabled', 'decideBuilds',
   'searchMarket', 'refreshMarketIndex', 'previewPackage',
+  'checkLauncherUpdate', 'runDoctor', 'testMirrors', 'exportPlugins', 'importPlugins',
   'updateSettings', 'cancelTask', 'pickDirectory', 'pickFile', 'openPath', 'openExternal',
 ] as const satisfies readonly LauncherMethod[]
 

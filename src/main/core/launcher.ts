@@ -1,10 +1,10 @@
 import { EventEmitter } from 'node:events'
-import { readdir, rm } from 'node:fs/promises'
+import { readdir, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type {
   AppState, LauncherEvent, LogLine, MarketPage, NoticeLevel, PackagePreview, PluginUpdate, PluginUpdateCheck,
-  MarketQuery, ProfileDetail, ProfileSummary, RemoteInfo, Settings, SettingsPatch,
+  CheckFix, CheckStatus, DoctorCheck, DoctorReport, ImportResult, LauncherRelease, MarketQuery, MirrorTiming, PluginExport, ProfileDetail, ProfileSummary, RemoteInfo, Settings, SettingsPatch,
 } from '../../shared/types'
 import {
   cleanupVersionsRoot, DSH_PACKAGE, dshBinPath, installDsh, listInstalled, newerOnChannel, pruneCandidates, removeDsh,
@@ -15,11 +15,14 @@ import { RELEASES_API, resolveEndpoints, type Endpoints } from './mirrors'
 import { DSH_NODE_RANGE, findInstalledNode, installNode, nodeBinDir, type NodeRuntime } from './node-runtime'
 import { launcherPaths, profileDir, resolveDshHome, type LauncherPaths } from './paths'
 import { MarketService } from './market'
+import { fetchLatestLauncherRelease, newerLauncher } from './self-update'
+import { emptyProxyVariables, latencyStatus, measureRegistry, mirrorCandidates } from './doctor'
+import { buildPluginExport, parsePluginList, restoreSpec } from './plugin-list'
 import {
   addCommands, explainPnpmFailure, findPluginUpdates, isBuildBlocked, planInstall, planUpdates, pnpmProgress, previewPackage,
   type InstallPlan,
 } from './plugins'
-import { installedPnpmVersion, installPnpm, PNPM_SPEC, writeShims } from './pnpm'
+import { installedPnpmVersion, installPnpm, pnpmCliPath, PNPM_SPEC, writeShims } from './pnpm'
 import { childEnvironment } from './environment'
 import { appendPath, prependPath, run } from './proc'
 import {
@@ -42,6 +45,8 @@ export interface PlatformHooks {
   openExternal(url: string): Promise<void>
   codec?: SecretCodec
   locale?: string
+  /** Register or remove the launcher as an OS login item. Unpackaged builds may ignore it. */
+  applyLoginItem?(enabled: boolean): void
 }
 
 export interface LauncherOptions {
@@ -63,6 +68,19 @@ function timestamp(): string {
   return new Date().toISOString().replace(/[:.]/g, '-')
 }
 
+/** Create the folder if needed and prove a file can be written there. */
+async function writableDir(dir: string): Promise<{ ok: boolean; detail: string }> {
+  try {
+    await ensureDir(dir)
+    const probe = join(dir, `.dsh-launcher-probe-${process.pid}`)
+    await writeFile(probe, 'ok')
+    await rm(probe, { force: true })
+    return { ok: true, detail: dir }
+  } catch (error) {
+    return { ok: false, detail: `${dir} 无法写入：${errorMessage(error)}` }
+  }
+}
+
 function lastLine(output: string): string {
   return output.trim().split(/\r?\n/).pop()?.trim() ?? ''
 }
@@ -82,6 +100,7 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
   private installed: DshInstall[] = []
   private remote: RemoteInfo | null = null
   private restartRequired = false
+  private launcherUpdate: LauncherRelease | null = null
   private notifiedVersion: string | null = null
   private readonly market: MarketService
   private readonly tasks = new TaskRunner()
@@ -125,6 +144,7 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
     await this.hooks.applyProxy(this.settings)
     await cleanupVersionsRoot(this.paths.versions)
     await this.refreshLocal()
+    this.hooks.applyLoginItem?.(this.settings.openAtLogin)
     this.scheduleUpdateChecks()
   }
 
@@ -171,6 +191,7 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
       process: this.supervisor.status,
       tasks: this.tasks.list(),
       restartRequired: this.restartRequired,
+      launcherUpdate: this.launcherUpdate,
     }
   }
 
@@ -325,6 +346,8 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
   }
 
   private async backgroundCheck(): Promise<void> {
+    // GitHub can be slow or unreachable from some networks; it must never hold up the dsh check.
+    void this.checkLauncherUpdate().catch(() => undefined)
     try {
       await this.checkUpdates()
     } catch {
@@ -336,6 +359,18 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
     this.notifiedVersion = target
     if (this.settings.autoDownload) await this.autoUpdate(target)
     else this.notice('info', `发现 dsh 新版本 ${target}，可在“版本”页更新`)
+  }
+
+  /** Look for a newer launcher release on GitHub; the sidebar offers it once found. */
+  async checkLauncherUpdate(): Promise<LauncherRelease | null> {
+    const release = await fetchLatestLauncherRelease(this.hooks.fetch)
+    const newer = newerLauncher(this.options.launcherVersion, release)
+    if (newer !== null && this.launcherUpdate?.version !== newer.version) {
+      this.notice('info', `启动器有新版本 v${newer.version}，可在左下角查看`)
+    }
+    this.launcherUpdate = newer
+    this.scheduleState()
+    return newer
   }
 
   private async autoUpdate(version: string): Promise<void> {
@@ -618,8 +653,13 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
   async installPlugin(profile: string, spec: string): Promise<void> {
     const { install } = await this.ready()
     const plan = await planInstall(this.hooks.fetch, this.endpoints.registry, spec, install.version, this.settings.channel)
+    return this.installPlans(profile, [plan])
+  }
+
+  /** Queue plans for one profile. Handing them over together keeps them in the same pnpm run. */
+  private installPlans(profile: string, plans: readonly InstallPlan[]): Promise<void> {
     const batch = this.installBatches.get(profile) ?? { plans: [], waiters: [], running: false }
-    batch.plans.push(plan)
+    batch.plans.push(...plans)
     this.installBatches.set(profile, batch)
     const settled = new Promise<void>((resolve, reject) => batch.waiters.push({ resolve, reject }))
     if (!batch.running) {
@@ -627,6 +667,41 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
       void this.flushInstalls(profile)
     }
     return settled
+  }
+
+  /** The plugin list of a profile, in the format "导入插件列表" reads back. */
+  async pluginExport(profile: string): Promise<PluginExport> {
+    const detail = await this.getProfile(profile)
+    if (!detail.exists) throw new Error(`配置 “${profile}” 还没有创建，没有可导出的插件`)
+    return buildPluginExport(detail, this.active?.version ?? null)
+  }
+
+  /**
+   * Install what a plugin list names in one pnpm run, then restore which bundles were off.
+   * Already-installed plugins and local paths from another machine are reported, not retried.
+   */
+  async importPluginList(profile: string, input: unknown): Promise<ImportResult> {
+    const listed = parsePluginList(input)
+    if (listed.length === 0) throw new Error('文件里没有可导入的插件')
+    const { install } = await this.ready()
+    const present = new Set((await this.getProfile(profile)).plugins.map(plugin => plugin.name))
+    const skipped: ImportResult['skipped'] = []
+    const wanted: string[] = []
+    for (const plugin of listed) {
+      if (present.has(plugin.name)) {
+        skipped.push({ name: plugin.name, reason: '已安装' })
+        continue
+      }
+      const restore = restoreSpec(plugin)
+      if ('skip' in restore) skipped.push({ name: plugin.name, reason: restore.skip })
+      else wanted.push(restore.spec)
+    }
+    const plans = await Promise.all(wanted.map(spec => planInstall(this.hooks.fetch, this.endpoints.registry, spec, install.version, this.settings.channel)))
+    if (plans.length > 0) await this.installPlans(profile, plans)
+    for (const plugin of listed.filter(item => !item.enabled && !present.has(item.name))) {
+      await this.setBundleEnabled(profile, plugin.name, false).catch(() => undefined)
+    }
+    return { requested: listed.length, installed: plans.map(plan => plan.label), skipped }
   }
 
   private async flushInstalls(profile: string): Promise<void> {
@@ -691,6 +766,97 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
     await this.pluginCommand(profile, `${blocked.title}（重试）`, [blocked.args])
   }
 
+  // ---- diagnostics ----
+
+  async testMirrors(): Promise<MirrorTiming[]> {
+    return Promise.all(mirrorCandidates(this.settings).map(async (candidate) => {
+      const { ms, error } = await measureRegistry(this.hooks.fetch, candidate.registry)
+      return { ...candidate, ms, error }
+    }))
+  }
+
+  /**
+   * Every check the last few support threads needed, in one pass. pnpm is exercised with the
+   * exact environment plugin installs get, so environment bugs surface here rather than there.
+   */
+  async runDoctor(): Promise<DoctorReport> {
+    const checks: DoctorCheck[] = []
+    const add = (id: string, title: string, status: CheckStatus, detail: string, fix: CheckFix | null = null) => {
+      checks.push({ id, title, status, detail, fix })
+    }
+    const probe = (command: string, args: string[], env?: NodeJS.ProcessEnv) =>
+      run(command, args, { env, cwd: this.paths.root }).catch((error: unknown) => ({ code: -1, output: errorMessage(error) }))
+
+    const runtime = this.node
+    if (runtime === null) {
+      add('node', 'Node.js 运行时', 'error', '尚未下载，在启动页点“一键安装”', 'setup')
+    } else {
+      const result = await probe(runtime.node, ['--version'])
+      if (result.code === 0) add('node', 'Node.js 运行时', 'ok', `v${runtime.version}`)
+      else add('node', 'Node.js 运行时', 'error', `无法运行：${lastLine(result.output)}`, 'setup')
+    }
+
+    const env = runtime === null ? null : await this.toolEnv(runtime)
+    if (env !== null) {
+      const empty = emptyProxyVariables(env)
+      if (empty.length > 0) add('proxy-env', '子进程网络环境', 'error', `这些代理变量是空值，pnpm 会报 Invalid URL：${empty.join(', ')}`, 'settings')
+      else add('proxy-env', '子进程网络环境', 'ok', '代理与下载源变量正常')
+    }
+
+    if (runtime === null || env === null || this.pnpmVersion === null) {
+      add('pnpm', 'pnpm', 'error', '尚未安装', 'setup')
+    } else {
+      const result = await probe(runtime.node, [pnpmCliPath(this.paths), 'config', 'get', 'registry'], env)
+      if (result.code === 0) add('pnpm', 'pnpm', 'ok', `${this.pnpmVersion}，使用下载源 ${lastLine(result.output)}`)
+      else add('pnpm', 'pnpm', 'error', `读取配置失败：${explainPnpmFailure(result.output) ?? lastLine(result.output)}`, 'settings')
+    }
+
+    const install = this.active
+    if (install === null || runtime === null) {
+      add('dsh', 'dsh', 'error', '尚未安装', 'setup')
+    } else {
+      const result = await probe(runtime.node, [await dshBinPath(install.dir), '--version'], env ?? undefined)
+      if (result.code === 0 && result.output.includes(install.version)) add('dsh', 'dsh', 'ok', `${install.version}（${this.settings.channel} 通道）`)
+      else add('dsh', 'dsh', 'error', `无法运行：${lastLine(result.output)}`, 'versions')
+    }
+
+    const registry = this.endpoints.registry
+    const timing = await measureRegistry(this.hooks.fetch, registry)
+    if (timing.ms === null) add('registry', '下载源', 'error', `${registry} 无法访问：${timing.error}`, 'settings')
+    else add('registry', '下载源', latencyStatus(timing.ms), `${registry} 响应 ${timing.ms} ms${timing.ms > 1500 ? '，偏慢，可在设置里测速换源' : ''}`, timing.ms > 1500 ? 'settings' : null)
+
+    const home = await writableDir(this.dshHome)
+    add('dsh-home', 'DSH_HOME', home.ok ? 'ok' : 'error', home.detail, home.ok ? null : 'settings')
+    const launch = this.settings.launch
+    const workspace = await writableDir(launch.workspace)
+    add('workspace', '工作区', workspace.ok ? 'ok' : 'error', workspace.detail, workspace.ok ? null : 'home')
+
+    const running = this.supervisor.running ? this.supervisor.status.port : null
+    if (running === launch.port) add('port', '启动端口', 'ok', `${launch.port}（dsh 正在使用）`)
+    else if (await isPortFree(launch.port)) add('port', '启动端口', 'ok', `${launch.port} 空闲`)
+    else if (launch.autoPort) add('port', '启动端口', 'warn', `${launch.port} 被其他程序占用，启动时会自动换用下一个空闲端口`, 'home')
+    else add('port', '启动端口', 'error', `${launch.port} 被其他程序占用，且没有开启自动换端口`, 'home')
+
+    const profile = (await listProfiles(this.dshHome)).find(item => item.name === launch.profile)
+    if (profile === undefined) {
+      add('profile', '启动配置', 'error', `找不到配置 “${launch.profile}”`, 'home')
+    } else if (!profile.web) {
+      add('profile', '启动配置', 'error', `“${launch.profile}” 不含 Web 界面，启动器无法启动它`, 'home')
+    } else {
+      add('profile', '启动配置', 'ok', `${launch.profile}（${profile.plugins} 个插件）`)
+      const detail = await this.getProfile(launch.profile)
+      if (detail.pendingBuilds.length > 0) add('builds', '构建脚本', 'error', `待决定：${detail.pendingBuilds.join('、')}。决定之前这个配置下的所有安装都会失败`, 'plugins')
+      else add('builds', '构建脚本', 'ok', '没有待决定的构建脚本')
+      const missing = detail.plugins.filter(plugin => plugin.version === null)
+      const suspect = detail.plugins.filter(plugin => plugin.compat === 'warn')
+      if (missing.length > 0) add('plugins', '插件状态', 'error', `文件缺失：${missing.map(plugin => plugin.name).join('、')}`, 'plugins')
+      else if (suspect.length > 0) add('plugins', '插件状态', 'warn', `声明的版本范围不含当前 dsh：${suspect.map(plugin => plugin.name).join('、')}`, 'plugins')
+      else add('plugins', '插件状态', 'ok', detail.plugins.length > 0 ? `${detail.plugins.length} 个插件都正常` : '没有安装第三方插件')
+    }
+
+    return { checkedAt: new Date().toISOString(), launcherVersion: this.options.launcherVersion, platform: `${this.platform}-${this.arch}`, checks }
+  }
+
   // ---- market ----
 
   async searchMarket(query: MarketQuery): Promise<MarketPage> {
@@ -727,6 +893,7 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
     await saveSettings(this.paths.settings, next, this.hooks.codec)
     if (before.proxyMode !== next.proxyMode || before.proxyUrl !== next.proxyUrl) await this.hooks.applyProxy(next)
     if (before.autoCheck !== next.autoCheck) this.scheduleUpdateChecks()
+    if (before.openAtLogin !== next.openAtLogin) this.hooks.applyLoginItem?.(next.openAtLogin)
     if (before.dshHome !== next.dshHome) this.send({ type: 'plugins-changed', profile: '*' })
     const launchInputs = (settings: Settings) => JSON.stringify([
       { ...settings.launch, openBrowser: null }, settings.dshHome, settings.mirror, settings.customRegistry,

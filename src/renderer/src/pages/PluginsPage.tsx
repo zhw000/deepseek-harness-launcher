@@ -1,4 +1,6 @@
-import { Box, CircleArrowUp, ExternalLink, FolderOpen, Package, PackagePlus, Plus, RefreshCw, Store, Trash2, TriangleAlert } from 'lucide-react'
+import {
+  Box, CircleArrowUp, ExternalLink, FileDown, FileUp, FolderOpen, Package, PackagePlus, Plus, RefreshCw, Store, Trash2, TriangleAlert,
+} from 'lucide-react'
 import { useEffect, useState } from 'react'
 import type { PluginInfo, PluginUpdate, PluginUpdateCheck, ProfileDetail } from '../../../shared/types'
 import { api } from '../api'
@@ -187,6 +189,22 @@ export function PluginsPage() {
             {profiles.map(item => <option key={item.name} value={item.name}>配置：{item.name}{item.web ? '' : '（非 Web）'}</option>)}
           </select>
           <button type="button" className="btn" onClick={() => setCreating(true)}><Plus size={15} />新建配置</button>
+          <button type="button" className="btn" disabled={busy} title="把这个配置的插件列表保存成文件，换电脑或重装后可以一键装回"
+            onClick={() => void run(async () => {
+              const path = await api.exportPlugins(profile)
+              if (path !== null) store.notify('success', `已导出到 ${path}`)
+            })}>
+            <FileDown size={15} />导出
+          </button>
+          <button type="button" className="btn" disabled={busy} title="从导出的插件列表，或另一台电脑 dsh 配置目录里的 package.json 安装"
+            onClick={() => void run(async () => {
+              const result = await api.importPlugins(profile)
+              if (result === null) return
+              const skipped = result.skipped.length > 0 ? `；跳过 ${result.skipped.length} 个（${result.skipped.map(item => `${item.name}：${item.reason}`).join('，')}）` : ''
+              store.notify(result.installed.length > 0 ? 'success' : 'info', `导入完成：安装 ${result.installed.length} 个${skipped}`)
+            })}>
+            <FileUp size={15} />导入
+          </button>
           <button type="button" className="btn icon" title="打开配置目录" onClick={() => void attempt(() => api.openPath('profile', profile))}><FolderOpen size={15} /></button>
         </div>
       </div>

@@ -42,6 +42,10 @@ export interface Settings {
   /** Overrides DSH_HOME; empty follows $DSH_HOME, then ~/.dsh, like dsh itself. */
   dshHome: string
   closeToTray: boolean
+  /** Start dsh as soon as the launcher opens. */
+  autoStartDsh: boolean
+  /** Register as a login item; a login start stays hidden in the tray. */
+  openAtLogin: boolean
   launch: LaunchSettings
 }
 
@@ -117,6 +121,8 @@ export interface AppState {
   tasks: TaskInfo[]
   /** Plugins or versions changed while dsh was running; a restart applies them. */
   restartRequired: boolean
+  /** A newer launcher release on GitHub, if one was found. */
+  launcherUpdate: LauncherRelease | null
 }
 
 export type SpecSource = 'registry' | 'git' | 'local' | 'tarball' | 'other'
@@ -272,3 +278,56 @@ export type LauncherEvent =
   | { type: 'task-log'; id: string; text: string }
   | { type: 'plugins-changed'; profile: string }
   | { type: 'notice'; level: NoticeLevel; message: string }
+
+/** A launcher release published on GitHub. */
+export interface LauncherRelease {
+  version: string
+  /** Release page, where both the installer and the portable exe are attached. */
+  url: string
+  publishedAt: string | null
+  notes: string
+}
+
+export type CheckStatus = 'ok' | 'warn' | 'error'
+/** Where the UI sends the user to fix a failed check. */
+export type CheckFix = 'setup' | 'home' | 'versions' | 'plugins' | 'settings'
+
+export interface DoctorCheck {
+  id: string
+  title: string
+  status: CheckStatus
+  detail: string
+  fix: CheckFix | null
+}
+
+export interface DoctorReport {
+  checkedAt: string
+  launcherVersion: string
+  platform: string
+  checks: DoctorCheck[]
+}
+
+export interface MirrorTiming {
+  mirror: MirrorId
+  label: string
+  registry: string
+  /** Best of a few samples, in milliseconds; null when unreachable. */
+  ms: number | null
+  error: string | null
+}
+
+/** The file format written by "导出插件列表". */
+export interface PluginExport {
+  format: 'dsh-launcher-plugins'
+  version: 1
+  exportedAt: string
+  profile: string
+  dshVersion: string | null
+  plugins: Array<{ name: string; spec: string; enabled: boolean }>
+}
+
+export interface ImportResult {
+  requested: number
+  installed: string[]
+  skipped: Array<{ name: string; reason: string }>
+}

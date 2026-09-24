@@ -1,10 +1,12 @@
-import { Eye, EyeOff, FolderOpen, Plus, RotateCcw, Trash2 } from 'lucide-react'
+import { Eye, EyeOff, FolderOpen, Gauge, Plus, RotateCcw, Trash2 } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
-import type { EnvVar, MirrorId, ProxyMode, SettingsPatch } from '../../../shared/types'
+import type { EnvVar, MirrorId, MirrorTiming, ProxyMode, SettingsPatch } from '../../../shared/types'
 import { api } from '../api'
-import { CommitInput, Field, Segmented, Switch } from '../components/ui'
+import { CommitInput, Field, Segmented, Spinner, Switch } from '../components/ui'
 import { MIRROR_LABELS } from '../format'
-import { attempt, useAppState } from '../store'
+import { attempt, store, useAction, useAppState } from '../store'
+
+const LAUNCHER_HOME = 'https://github.com/zhw000/deepseek-harness-launcher'
 
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/
 const save = (patch: SettingsPatch, message?: string) => void attempt(() => api.updateSettings(patch), message)
@@ -69,7 +71,12 @@ const MIRROR_OPTIONS: Array<{ value: MirrorId; hint: string }> = [
 ]
 
 export function SettingsPage() {
-  const { settings, paths, launcherVersion, platform } = useAppState()
+  const { settings, paths, launcherVersion, platform, launcherUpdate } = useAppState()
+  const [timings, setTimings] = useState<MirrorTiming[] | null>(null)
+  const [testing, runTest] = useAction()
+  const [checking, runCheck] = useAction()
+  const reachable = timings?.filter(item => item.ms !== null) ?? []
+  const fastest = reachable.length > 0 ? reachable.reduce((best, item) => (item.ms! < best.ms! ? item : best)) : null
   const launch = settings.launch
   return (
     <div className="page">
@@ -82,15 +89,27 @@ export function SettingsPage() {
 
       <Section title="下载源" description="用于下载 Node.js、pnpm、dsh 和插件。插件市场的搜索始终使用 npmjs.org。">
         <div className="stack">
-          {MIRROR_OPTIONS.map(option => (
-            <label key={option.value} className="row radio-row">
-              <input type="radio" name="mirror" checked={settings.mirror === option.value} onChange={() => save({ mirror: option.value })} />
-              <div className="grow">
-                <div>{MIRROR_LABELS[option.value]}</div>
-                <div className="faint">{option.hint}</div>
-              </div>
-            </label>
-          ))}
+          {MIRROR_OPTIONS.map((option) => {
+            const timing = timings?.find(item => item.mirror === option.value)
+            return (
+              <label key={option.value} className="row radio-row">
+                <input type="radio" name="mirror" checked={settings.mirror === option.value} onChange={() => save({ mirror: option.value })} />
+                <div className="grow">
+                  <div>{MIRROR_LABELS[option.value]}</div>
+                  <div className="faint">{option.hint}</div>
+                </div>
+                {timing !== undefined && (timing.ms === null
+                  ? <span className="badge danger" title={timing.error ?? ''}>无法访问</span>
+                  : <span className={`badge ${timing === fastest ? 'success' : ''}`}>{timing === fastest ? '最快 · ' : ''}{timing.ms} ms</span>)}
+              </label>
+            )
+          })}
+          <div className="row">
+            <button type="button" className="btn sm" disabled={testing} onClick={() => void runTest(async () => setTimings(await api.testMirrors()))}>
+              {testing ? <Spinner size={14} /> : <Gauge size={14} />}测速
+            </button>
+            <span className="faint">从这台电脑实测各下载源的响应时间，方便挑最快的那个。</span>
+          </div>
           {settings.mirror === 'custom' && (
             <div className="grid-2">
               <Field label="npm registry">
@@ -117,6 +136,8 @@ export function SettingsPage() {
       <Section title="启动选项">
         <ToggleRow title="端口被占用时自动换一个" hint={`首选端口 ${launch.port} 被占用时，使用后面第一个空闲端口`} on={launch.autoPort} onChange={autoPort => save({ launch: { autoPort } })} />
         <ToggleRow title="关闭窗口时最小化到托盘" hint="dsh 运行时关闭窗口不会退出，可从托盘图标打开或退出" on={settings.closeToTray} onChange={closeToTray => save({ closeToTray })} />
+        <ToggleRow title="打开启动器时自动启动 dsh" hint="省去每次手动点“启动”；还没安装 dsh 时不会生效" on={settings.autoStartDsh} onChange={autoStartDsh => save({ autoStartDsh })} />
+        <ToggleRow title="开机自动运行" hint="登录系统后在托盘里静默启动，不弹出窗口；配合上一项即可开机就绪" on={settings.openAtLogin} onChange={openAtLogin => save({ openAtLogin })} />
         <ToggleRow title="关闭 OpenTelemetry 反馈上报" hint={<>设置 <code>DSH_TELEMETRY_MODE=DISABLED</code>。dsh 发给 DeepSeek 的会话日志另由其配置项控制</>}
           on={launch.disableTelemetry} onChange={disableTelemetry => save({ launch: { disableTelemetry } })} />
         <div className="divider" />
@@ -153,8 +174,19 @@ export function SettingsPage() {
 
       <Section title="关于">
         <dl className="kv">
-          <dt>启动器版本</dt><dd className="mono">{launcherVersion}</dd>
+          <dt>启动器版本</dt>
+          <dd className="row" style={{ gap: 10 }}>
+            <span className="mono">{launcherVersion}</span>
+            {launcherUpdate !== null
+              ? <a onClick={() => void attempt(() => api.openExternal(launcherUpdate.url))}>有新版本 v{launcherUpdate.version}，前往下载</a>
+              : <button type="button" className="btn ghost sm" disabled={checking} onClick={() => void runCheck(async () => {
+                const release = await api.checkLauncherUpdate()
+                if (release === null) store.notify('success', '启动器已是最新版本')
+              })}>{checking ? <Spinner size={13} /> : null}检查更新</button>}
+          </dd>
           <dt>平台</dt><dd className="mono">{platform}</dd>
+          <dt>源代码</dt>
+          <dd><a onClick={() => void attempt(() => api.openExternal(LAUNCHER_HOME))}>github.com/zhw000/deepseek-harness-launcher</a></dd>
           <dt>DeepSeek Harness</dt>
           <dd><a onClick={() => void attempt(() => api.openExternal('https://github.com/deepseek-ai/deepseek-harness'))}>github.com/deepseek-ai/deepseek-harness</a></dd>
         </dl>

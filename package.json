@@ -1,7 +1,7 @@
 {
   "name": "dsh-launcher",
   "productName": "DSH Launcher",
-  "version": "0.1.5",
+  "version": "1.0.0",
   "description": "DeepSeek Harness 启动器：自动下载运行时与 dsh、版本更新、插件安装与管理",
   "main": "./out/main/index.js",
   "author": "zhw000",
@@ -39,5 +39,13 @@
     "typescript": "^7.0.2",
     "vite": "^7.3.6",
     "vitest": "^5.0.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zhw000/deepseek-harness-launcher.git"
+  },
+  "homepage": "https://github.com/zhw000/deepseek-harness-launcher",
+  "bugs": {
+    "url": "https://github.com/zhw000/deepseek-harness-launcher/issues"
   }
 }

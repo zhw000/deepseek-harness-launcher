@@ -7,14 +7,16 @@ import {
 } from 'electron'
 import iconPath from '../../resources/icon.png?asset'
 import { API_METHODS, EVENT_CHANNEL, INVOKE_CHANNEL, type InvokeResult, type LauncherApi, type LauncherMethod, type OpenTarget } from '../shared/api'
-import type { LauncherEvent, Phase, Settings } from '../shared/types'
+import type { ImportResult, LauncherEvent, Phase, Settings } from '../shared/types'
 import { LauncherService } from './core/launcher'
 import { defaultDataRoot } from './core/paths'
 import type { SecretCodec } from './core/settings'
 import { ensureDir, errorMessage } from './core/util'
 
 /** Methods answered here because they need Electron; the service answers the rest. */
-const SHELL_METHODS = ['pickDirectory', 'pickFile', 'openPath', 'openExternal'] as const
+const SHELL_METHODS = ['pickDirectory', 'pickFile', 'openPath', 'openExternal', 'exportPlugins', 'importPlugins'] as const
+/** Passed by the login item: start in the tray without showing the window. */
+const HIDDEN_FLAG = '--hidden'
 type ServiceMethod = Exclude<LauncherMethod, (typeof SHELL_METHODS)[number]>
 type Awaitable<F> = F extends (...args: infer A) => Promise<infer R> ? (...args: A) => R | Promise<R> : never
 /** Compile-time proof that the service implements every forwarded API method. */
@@ -84,6 +86,47 @@ async function pickDirectory(initial?: string): Promise<string | null> {
   return result.canceled ? null : result.filePaths[0] ?? null
 }
 
+async function exportPlugins(profile: string): Promise<string | null> {
+  const data = await service!.pluginExport(profile)
+  const options: Electron.SaveDialogOptions = {
+    title: '导出插件列表',
+    defaultPath: `dsh-plugins-${profile}.json`,
+    filters: [{ name: '插件列表', extensions: ['json'] }],
+  }
+  const result = mainWindow ? await dialog.showSaveDialog(mainWindow, options) : await dialog.showSaveDialog(options)
+  if (result.canceled || !result.filePath) return null
+  await writeFile(result.filePath, JSON.stringify(data, undefined, 2) + '\n')
+  return result.filePath
+}
+
+async function importPlugins(profile: string): Promise<ImportResult | null> {
+  const options: Electron.OpenDialogOptions = {
+    title: '导入插件列表',
+    properties: ['openFile'],
+    filters: [{ name: '插件列表或 package.json', extensions: ['json'] }],
+  }
+  const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options)
+  const file = result.filePaths[0]
+  if (result.canceled || file === undefined) return null
+  let data: unknown
+  try {
+    data = JSON.parse(await readFile(file, 'utf8'))
+  } catch {
+    throw new Error('无法读取这个文件：它不是有效的 JSON')
+  }
+  return service!.importPluginList(profile, data)
+}
+
+/**
+ * A login start opens straight to the tray. The portable build runs from a temp copy, so
+ * the login item must point at the real exe, or it breaks when that copy is cleaned up.
+ */
+function applyLoginItem(enabled: boolean): void {
+  if (!app.isPackaged || process.platform === 'linux') return
+  const path = process.env.PORTABLE_EXECUTABLE_FILE ?? process.execPath
+  app.setLoginItemSettings({ openAtLogin: enabled, path, args: [HIDDEN_FLAG] })
+}
+
 async function pickFile(): Promise<string | null> {
   const options: Electron.OpenDialogOptions = { properties: ['openFile'], filters: [{ name: '插件压缩包', extensions: ['tgz', 'gz'] }] }
   const result = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options)
@@ -124,6 +167,8 @@ async function dispatch(method: LauncherMethod, args: unknown[]): Promise<unknow
     case 'pickFile': return pickFile()
     case 'openPath': return openPath(args[0] as OpenTarget, args[1] as string | undefined)
     case 'openExternal': return openExternal(String(args[0]))
+    case 'exportPlugins': return exportPlugins(String(args[0]))
+    case 'importPlugins': return importPlugins(String(args[0]))
     default: {
       const handler = contract![method] as (...values: unknown[]) => unknown
       return await handler.apply(service, args)
@@ -182,7 +227,9 @@ function createWindow(): void {
     },
   })
   mainWindow = window
-  window.once('ready-to-show', () => window.show())
+  window.once('ready-to-show', () => {
+    if (!process.argv.includes(HIDDEN_FLAG)) window.show()
+  })
   window.on('close', (event) => {
     if (quitting || !service?.isRunning || !service.currentSettings.closeToTray) return
     event.preventDefault()
@@ -263,6 +310,7 @@ async function boot(): Promise<void> {
       applyProxy,
       childProxy,
       openExternal,
+      applyLoginItem,
       codec: secretCodec(),
       locale: app.getLocale(),
     },
@@ -274,6 +322,8 @@ async function boot(): Promise<void> {
   registerIpc()
   createWindow()
   createTray()
+  const { autoStartDsh, activeVersion } = launcher.currentSettings
+  if (autoStartDsh && activeVersion !== null) void launcher.start().catch(reportError)
 }
 
 if (!app.requestSingleInstanceLock()) {

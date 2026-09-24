@@ -1,21 +1,23 @@
-import { Layers, Puzzle, Rocket, Settings, Store } from 'lucide-react'
+import { CircleArrowUp, HeartPulse, Layers, Puzzle, Rocket, Settings, Store } from 'lucide-react'
 import { useEffect, type ComponentType } from 'react'
-import { isMock } from './api'
+import { api, isMock } from './api'
 import { TaskDock } from './components/TaskDock'
 import { ConfirmHost, Spinner, Toasts } from './components/ui'
 import { PHASES } from './format'
+import { DoctorPage } from './pages/DoctorPage'
 import { HomePage } from './pages/HomePage'
 import { MarketPage } from './pages/MarketPage'
 import { PluginsPage } from './pages/PluginsPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { VersionsPage } from './pages/VersionsPage'
-import { store, useRoute, useStore, type Route } from './store'
+import { attempt, store, useRoute, useStore, type Route } from './store'
 
 const NAV: Array<{ route: Route; label: string; icon: ComponentType<{ size?: number }>; page: ComponentType }> = [
   { route: 'home', label: '启动', icon: Rocket, page: HomePage },
   { route: 'versions', label: '版本', icon: Layers, page: VersionsPage },
   { route: 'plugins', label: '插件', icon: Puzzle, page: PluginsPage },
   { route: 'market', label: '插件市场', icon: Store, page: MarketPage },
+  { route: 'doctor', label: '体检', icon: HeartPulse, page: DoctorPage },
   { route: 'settings', label: '设置', icon: Settings, page: SettingsPage },
 ]
 
@@ -55,6 +57,11 @@ export function App() {
             dsh {PHASES[phase]}
             {state.process.port !== null && phase === 'running' && <span className="faint mono">:{state.process.port}</span>}
           </div>
+          {state.launcherUpdate !== null && (
+            <button type="button" className="sidebar-update" onClick={() => void attempt(() => api.openExternal(state.launcherUpdate!.url))}>
+              <CircleArrowUp size={14} />启动器 v{state.launcherUpdate.version} 可更新
+            </button>
+          )}
           <div className="sidebar-version">
             启动器 v{state.launcherVersion}{isMock && ' · 演示数据'}
           </div>

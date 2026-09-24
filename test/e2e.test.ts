@@ -64,10 +64,43 @@ describe.skipIf(!enabled)('end to end against npm and a real dsh', () => {
     plugin = (await service.getProfile(PROFILE)).plugins.find(item => item.name === PLUGIN)
     expect(plugin?.enabled).toBe(false)
     await service.setBundleEnabled(PROFILE, PLUGIN, true)
-    expect(await service.checkPluginUpdates(PROFILE)).toEqual({ updates: [], failures: [] })
+    // Pinned to the running dsh version, so it never shows as outdated. Other plugins in a
+    // reused profile may legitimately have updates; they are not this test's concern.
+    const check = await service.checkPluginUpdates(PROFILE)
+    expect(check.updates.find(update => update.name === PLUGIN)).toBeUndefined()
+    expect(check.failures).toEqual([])
 
     await service.removePlugin(PROFILE, PLUGIN)
     expect((await service.getProfile(PROFILE)).plugins.find(item => item.name === PLUGIN)).toBeUndefined()
+  }, 10 * MINUTE)
+
+  it('exports a plugin list and restores it into another profile in one pnpm run', async () => {
+    const seeds = ['dsh-whale-widget', 'dsh-neu-theme']
+    await Promise.all(seeds.map(spec => service.installPlugin(PROFILE, spec)))
+    const exported = await service.pluginExport(PROFILE)
+    expect(exported.plugins.map(plugin => plugin.name)).toEqual(expect.arrayContaining(seeds))
+
+    const target = 'e2e-import'
+    if (!(await service.listProfiles()).some(profile => profile.name === target)) await service.createProfile(target)
+    const list = {
+      ...exported,
+      plugins: [
+        ...exported.plugins.filter(plugin => seeds.includes(plugin.name)),
+        { name: 'dsh-local-tool', spec: 'link:C:/nowhere/dsh-local-tool', enabled: true },
+      ],
+    }
+    const result = await service.importPluginList(target, list)
+    expect(result.installed).toHaveLength(seeds.length)
+    expect(result.skipped).toEqual([{ name: 'dsh-local-tool', reason: '本地目录在这台电脑上不存在' }])
+    const restored = await service.getProfile(target)
+    expect(restored.plugins.map(plugin => plugin.name)).toEqual(expect.arrayContaining(seeds))
+    // A second import is a no-op: everything is already there.
+    const again = await service.importPluginList(target, list)
+    expect(again.installed).toEqual([])
+    for (const name of seeds) {
+      await service.removePlugin(target, name)
+      await service.removePlugin(PROFILE, name)
+    }
   }, 10 * MINUTE)
 
   it('starts dsh web, signs in with the announced token, and stops through the graceful drain', async () => {

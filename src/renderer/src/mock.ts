@@ -72,7 +72,7 @@ export function createMockBridge(): LauncherBridge {
     paths: { root: `${HOME}/AppData/Local/dsh-launcher`, dshHome: `${HOME}/.dsh`, logs: `${HOME}/AppData/Local/dsh-launcher/logs` },
     settings: {
       channel: 'latest', activeVersion: '0.1.5-rc.1', pendingVersion: null, autoCheck: true, autoDownload: false, keepVersions: 2,
-      mirror: 'npmmirror', customRegistry: '', customNodeMirror: '', proxyMode: 'system', proxyUrl: '', dshHome: '', closeToTray: true,
+      mirror: 'npmmirror', customRegistry: '', customNodeMirror: '', proxyMode: 'system', proxyUrl: '', dshHome: '', closeToTray: true, autoStartDsh: false, openAtLogin: false,
       launch: {
         profile: 'web', port: 3080, autoPort: true, openBrowser: true, workspace: `${HOME}/dsh-workspace`, extraArgs: '',
         env: [{ key: 'DEEPSEEK_API_KEY', value: 'sk-sample' }], disableTelemetry: false,
@@ -92,6 +92,7 @@ export function createMockBridge(): LauncherBridge {
     process: idle(),
     tasks: [],
     restartRequired: false,
+    launcherUpdate: null,
   }
   const profiles: Record<string, ProfileDetail> = {
     web: {
@@ -313,6 +314,45 @@ export function createMockBridge(): LauncherBridge {
         name: spec, version: found?.version ?? '1.0.0', description: found?.description ?? '', license: 'MIT', homepage: null,
         bundle: !spec.includes('lib'), compat: 'ok', compatNote: null, installScripts: spec.includes('native'), deprecated: null, migrateTo: null,
       }
+    },
+    checkLauncherUpdate: async () => {
+      await wait(500)
+      return null
+    },
+    runDoctor: async () => {
+      await wait(900)
+      return {
+        checkedAt: now(),
+        launcherVersion: state.launcherVersion,
+        platform: 'win32-x64',
+        checks: [
+          { id: 'node', title: 'Node.js 运行时', status: 'ok', detail: 'v24.21.0', fix: null },
+          { id: 'proxy-env', title: '子进程网络环境', status: 'ok', detail: '代理与下载源变量正常', fix: null },
+          { id: 'pnpm', title: 'pnpm', status: 'ok', detail: '11.26.0，使用下载源 https://registry.npmmirror.com/', fix: null },
+          { id: 'dsh', title: 'dsh', status: 'ok', detail: `${state.settings.activeVersion}（latest 通道）`, fix: null },
+          { id: 'registry', title: '下载源', status: 'ok', detail: 'https://registry.npmmirror.com 响应 132 ms', fix: null },
+          { id: 'dsh-home', title: 'DSH_HOME', status: 'ok', detail: `${HOME}/.dsh`, fix: null },
+          { id: 'workspace', title: '工作区', status: 'ok', detail: `${HOME}/dsh-workspace`, fix: null },
+          { id: 'port', title: '启动端口', status: 'ok', detail: '3080 空闲', fix: null },
+          { id: 'profile', title: '启动配置', status: 'ok', detail: 'web（5 个插件）', fix: null },
+          { id: 'builds', title: '构建脚本', status: 'ok', detail: '没有待决定的构建脚本', fix: null },
+          { id: 'plugins', title: '插件状态', status: 'warn', detail: '声明的版本范围不含当前 dsh：dsh-sample-legacy', fix: 'plugins' },
+        ],
+      }
+    },
+    testMirrors: async () => {
+      await wait(700)
+      return [
+        { mirror: 'npmmirror', label: 'npmmirror 国内镜像', registry: 'https://registry.npmmirror.com', ms: 132, error: null },
+        { mirror: 'official', label: '官方源（npmjs.org / nodejs.org）', registry: 'https://registry.npmjs.org', ms: 684, error: null },
+      ]
+    },
+    exportPlugins: async name => `${HOME}/Downloads/dsh-plugins-${name}.json`,
+    importPlugins: async (name) => {
+      await task('安装 2 个插件', 10)
+      detail(name).plugins.push(plugin('dsh-sample-memory', '0.5.11'), plugin('dsh-sample-search', '5.10.3'))
+      changed(name)
+      return { requested: 3, installed: ['dsh-sample-memory', 'dsh-sample-search'], skipped: [{ name: 'dsh-local-tool', reason: '本地目录在这台电脑上不存在' }] }
     },
     updateSettings: async (patch: SettingsPatch) => {
       state.settings = { ...state.settings, ...patch, launch: { ...state.settings.launch, ...patch.launch } }

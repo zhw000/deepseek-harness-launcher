@@ -169,8 +169,8 @@ export function useAction(): [boolean, <T>(work: () => Promise<T>, success?: str
   return [busy, run]
 }
 
-export type Route = 'home' | 'versions' | 'plugins' | 'market' | 'settings'
-const ROUTES: Route[] = ['home', 'versions', 'plugins', 'market', 'settings']
+export type Route = 'home' | 'versions' | 'plugins' | 'market' | 'doctor' | 'settings'
+const ROUTES: Route[] = ['home', 'versions', 'plugins', 'market', 'doctor', 'settings']
 
 function readRoute(): Route {
   const name = window.location.hash.replace(/^#\/?/, '')

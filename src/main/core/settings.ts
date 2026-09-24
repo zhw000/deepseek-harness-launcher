@@ -30,6 +30,8 @@ export function defaultSettings(home: string, locale = 'en'): Settings {
     proxyUrl: '',
     dshHome: '',
     closeToTray: true,
+    autoStartDsh: false,
+    openAtLogin: false,
     launch: {
       profile: 'web',
       port: 3080,
@@ -90,6 +92,8 @@ export function normalizeSettings(input: unknown, defaults: Settings): Settings 
     proxyUrl: text(raw.proxyUrl, defaults.proxyUrl).trim(),
     dshHome: text(raw.dshHome, defaults.dshHome).trim(),
     closeToTray: bool(raw.closeToTray, defaults.closeToTray),
+    autoStartDsh: bool(raw.autoStartDsh, defaults.autoStartDsh),
+    openAtLogin: bool(raw.openAtLogin, defaults.openAtLogin),
     launch: normalizedLaunch,
   }
 }
