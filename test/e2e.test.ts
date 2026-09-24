@@ -1,6 +1,8 @@
+import { readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { parseDocument } from 'yaml'
 import { LauncherService } from '../src/main/core/launcher'
 
 /**
@@ -70,8 +72,55 @@ describe.skipIf(!enabled)('end to end against npm and a real dsh', () => {
     expect(check.updates.find(update => update.name === PLUGIN)).toBeUndefined()
     expect(check.failures).toEqual([])
 
+    // Uninstalling returns at once with the bundle already off; pnpm finishes in the background.
+    const started = Date.now()
     await service.removePlugin(PROFILE, PLUGIN)
+    expect(Date.now() - started).toBeLessThan(5_000)
+    const leaving = (await service.getProfile(PROFILE)).plugins.find(item => item.name === PLUGIN)
+    expect(leaving?.removing).toBe(true)
+    expect(leaving?.enabled).toBe(false)
+    await service.whenIdle()
     expect((await service.getProfile(PROFILE)).plugins.find(item => item.name === PLUGIN)).toBeUndefined()
+  }, 10 * MINUTE)
+
+  it('gets past pnpm release-age holds: by itself by default, after a trust in strict mode', async () => {
+    const version = service.getState().settings.activeVersion
+    await service.installPlugin(PROFILE, PLUGIN)
+    const dir = (await service.getProfile(PROFILE)).dir
+    const workspace = join(dir, 'pnpm-workspace.yaml')
+    const original = await readFile(workspace, 'utf8')
+    // A ten-year window makes every lockfile entry too new, and excluding all but PLUGIN leaves
+    // exactly one hold — the state a run that failed before pnpm recorded its picks leaves behind.
+    // (pnpm cannot negate a scoped name, so the others are listed one by one.)
+    const lockfile = parseDocument(await readFile(join(dir, 'pnpm-lock.yaml'), 'utf8')).toJS() as { packages?: Record<string, unknown> }
+    const others = [...new Set(Object.keys(lockfile.packages ?? {}).map(key => key.slice(0, key.indexOf('@', 1))))].filter(name => name !== PLUGIN)
+    const gate = async (strict: boolean) => {
+      const document = parseDocument(original)
+      document.set('minimumReleaseAge', 10 * 365 * 24 * 60)
+      document.set('minimumReleaseAgeStrict', strict)
+      document.set('minimumReleaseAgeExclude', document.createNode(others))
+      await writeFile(workspace, String(document))
+    }
+    const excluded = async () => (parseDocument(await readFile(workspace, 'utf8')).toJS() as { minimumReleaseAgeExclude?: string[] }).minimumReleaseAgeExclude ?? []
+    try {
+      await gate(false)
+      await service.installPlugin(PROFILE, PLUGIN)
+      expect(await excluded()).toContain(`${PLUGIN}@${version}`)
+      const [latest] = service.getState().tasks
+      expect(service.getTaskLog(latest.id)).toContain(`按 pnpm 默认策略信任 1 个刚发布的版本（记入 minimumReleaseAgeExclude）后重试：${PLUGIN}@${version}`)
+      expect((await service.getProfile(PROFILE)).releaseAgeHolds).toEqual([])
+
+      await gate(true)
+      await expect(service.installPlugin(PROFILE, PLUGIN)).rejects.toThrow(/发布不满 [0-9]+ 天的版本（1 个）/)
+      expect((await service.getProfile(PROFILE)).releaseAgeHolds).toMatchObject([{ name: PLUGIN, version }])
+      await service.trustReleaseAge(PROFILE)
+      expect(await excluded()).toContain(`${PLUGIN}@${version}`)
+      expect((await service.getProfile(PROFILE)).releaseAgeHolds).toEqual([])
+    } finally {
+      await writeFile(workspace, original)
+      await service.removePlugin(PROFILE, PLUGIN)
+      await service.whenIdle()
+    }
   }, 10 * MINUTE)
 
   it('exports a plugin list and restores it into another profile in one pnpm run', async () => {
@@ -101,6 +150,8 @@ describe.skipIf(!enabled)('end to end against npm and a real dsh', () => {
       await service.removePlugin(target, name)
       await service.removePlugin(PROFILE, name)
     }
+    await service.whenIdle()
+    expect((await service.getProfile(target)).plugins.filter(item => seeds.includes(item.name))).toEqual([])
   }, 10 * MINUTE)
 
   it('starts dsh web, signs in with the announced token, and stops through the graceful drain', async () => {

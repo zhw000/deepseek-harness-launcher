@@ -337,8 +337,8 @@ if (!app.requestSingleInstanceLock()) {
   app.on('before-quit', (event) => {
     if (quitting) return
     quitting = true
-    if (service?.isRunning) {
-      // Let dsh drain its sessions before the launcher goes away.
+    if (service?.isRunning || service?.hasPendingWork) {
+      // Let dsh drain its sessions, and pnpm finish, before the launcher goes away.
       event.preventDefault()
       void service.dispose().finally(() => app.quit())
     }

@@ -1,7 +1,7 @@
 import { stat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import semver from 'semver'
-import type { Channel, PackagePreview, PluginInfo, PluginUpdate, PluginUpdateCheck } from '../../shared/types'
+import type { Channel, PackagePreview, PluginInfo, PluginUpdate, PluginUpdateCheck, ReleaseAgeHold } from '../../shared/types'
 import type { FetchFn } from './http'
 import {
   compatibility, fetchManifest, fetchPackument, hasInstallScripts, parsePackageSpec, repositoryUrl, resolveVersion,
@@ -158,4 +158,52 @@ export function pnpmProgress(text: string): string | null {
   if (packages !== null) return `变更包：${packages[1]}`
   if (/Lockfile passes supply-chain policies/.test(text)) return '供应链校验通过'
   return null
+}
+
+/** pnpm 11 refuses anything published less than a day ago unless it is excluded. */
+export const RELEASE_AGE_HOURS = 24
+
+export function isReleaseAgeBlocked(output: string): boolean {
+  return /ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION|\[MINIMUM_RELEASE_AGE_VIOLATION\]|within the minimumReleaseAge cutoff|could not be checked against minimumReleaseAge/.test(output)
+}
+
+/**
+ * The entries pnpm listed, from lines like
+ * `  @scope/pkg@1.2.3 was published at 2026-09-24T07:08:38.189Z, within the minimumReleaseAge cutoff (…)`
+ * — strict mode puts a single new pick on the `[ERR_PNPM_NO_MATURE_MATCHING_VERSION]` line itself —
+ * or, when a mirror has not synced the publish time yet,
+ * `  pkg@1.2.3 could not be checked against minimumReleaseAge (version not present in registry manifest)`.
+ * pnpm prints at most 20; the rest surface on the next attempt. Only exact semver versions come
+ * back, because pnpm rejects anything else in `minimumReleaseAgeExclude` on every later run.
+ */
+export function parseReleaseAgeHolds(output: string): ReleaseAgeHold[] {
+  const pattern = /^\s*(?:\[?ERR_PNPM_[A-Z_]+\]?:?\s+)?(@[^\s/@]+\/[^\s@]+|[^\s@[\]]+)@(\S+) (?:\[(?:ERR_PNPM_)?MINIMUM_RELEASE_AGE_VIOLATION\] )?(?:was published at (\S+), within the minimumReleaseAge cutoff|could not be checked against minimumReleaseAge|publish timestamp is not a valid date)/gm
+  const holds = new Map<string, ReleaseAgeHold>()
+  for (const match of output.matchAll(pattern)) {
+    if (semver.valid(match[2]) !== match[2]) continue
+    holds.set(`${match[1]}@${match[2]}`, { name: match[1], version: match[2], publishedAt: match[3] ?? null })
+  }
+  return [...holds.values()]
+}
+
+/**
+ * The window pnpm applied, read back from the cutoff it printed — the output comes straight from
+ * the run, so `now` stands in for when pnpm computed it. pnpm's default when there is no cutoff.
+ */
+export function releaseAgeWindowHours(output: string, now = Date.now()): number {
+  const cutoff = /within the minimumReleaseAge cutoff \(([^)\s]+)\)/.exec(output)
+  const time = cutoff === null ? Number.NaN : Date.parse(cutoff[1])
+  return Number.isNaN(time) ? RELEASE_AGE_HOURS : Math.max(1, Math.round((now - time) / 3_600_000))
+}
+
+/** "24 小时", or whole days once the window runs past two of them. */
+export function formatReleaseAgeWindow(hours: number): string {
+  return hours < 48 ? `${hours} 小时` : `${Math.round(hours / 24)} 天`
+}
+
+/** Whole hours until the newest held version clears the window, or null when any time is unknown. */
+export function hoursUntilCleared(holds: readonly ReleaseAgeHold[], now = Date.now(), windowHours = RELEASE_AGE_HOURS): number | null {
+  const times = holds.map(hold => Date.parse(hold.publishedAt ?? '')).filter(time => !Number.isNaN(time))
+  if (times.length === 0 || times.length < holds.length) return null
+  return Math.max(0, Math.ceil((Math.max(...times) + windowHours * 3_600_000 - now) / 3_600_000))
 }

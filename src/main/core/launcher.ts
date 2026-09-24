@@ -4,7 +4,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type {
   AppState, LauncherEvent, LogLine, MarketPage, NoticeLevel, PackagePreview, PluginUpdate, PluginUpdateCheck,
-  CheckFix, CheckStatus, DoctorCheck, DoctorReport, ImportResult, LauncherRelease, MarketQuery, MirrorTiming, PluginExport, ProfileDetail, ProfileSummary, RemoteInfo, Settings, SettingsPatch,
+  CheckFix, CheckStatus, DoctorCheck, DoctorReport, ImportResult, LauncherRelease, MarketQuery, MirrorTiming, PluginExport, ProfileDetail, ProfileSummary, ReleaseAgeHold, RemoteInfo, Settings, SettingsPatch,
 } from '../../shared/types'
 import {
   cleanupVersionsRoot, DSH_PACKAGE, dshBinPath, installDsh, listInstalled, newerOnChannel, pruneCandidates, removeDsh,
@@ -19,21 +19,22 @@ import { fetchLatestLauncherRelease, newerLauncher } from './self-update'
 import { emptyProxyVariables, latencyStatus, measureRegistry, mirrorCandidates } from './doctor'
 import { buildPluginExport, parsePluginList, restoreSpec } from './plugin-list'
 import {
-  addCommands, explainPnpmFailure, findPluginUpdates, isBuildBlocked, planInstall, planUpdates, pnpmProgress, previewPackage,
+  addCommands, explainPnpmFailure, findPluginUpdates, formatReleaseAgeWindow, hoursUntilCleared, isBuildBlocked, isReleaseAgeBlocked,
+  parseReleaseAgeHolds, planInstall, planUpdates, pnpmProgress, previewPackage, releaseAgeWindowHours,
   type InstallPlan,
 } from './plugins'
 import { installedPnpmVersion, installPnpm, pnpmCliPath, PNPM_SPEC, writeShims } from './pnpm'
 import { childEnvironment } from './environment'
 import { appendPath, prependPath, run } from './proc'
 import {
-  decideBuilds, installationBundles, listProfiles, readPendingBuilds, readProfileDetail, setBundleEnabled,
-  validateProfileName, type InstallationBundle,
+  decideBuilds, installationBundles, listProfiles, readPendingBuilds, readProfileDetail, releaseAgeStrict, setBundleEnabled,
+  trustReleaseAge, validateProfileName, type InstallationBundle,
 } from './profiles'
 import { fetchPackument } from './registry'
 import { applySettingsPatch, defaultSettings, loadSettings, saveSettings, type SecretCodec } from './settings'
 import { DshSupervisor, ensureBridge, findFreePort, isPortFree, splitLaunchArgs } from './supervisor'
 import { TaskRunner, type TaskHandle } from './tasks'
-import { ensureDir, errorMessage, pathExists, splitArgs } from './util'
+import { ensureDir, errorMessage, pathExists, sleep, splitArgs } from './util'
 
 /** What differs between the Electron app and tests. */
 export interface PlatformHooks {
@@ -107,8 +108,14 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
   private readonly supervisor = new DshSupervisor()
   private readonly bundleCache = new Map<string, Promise<InstallationBundle[]>>()
   private readonly releaseNotes = new Map<string, string | null>()
-  /** Last install pnpm blocked on build scripts, retried once they are approved. */
-  private readonly blockedInstalls = new Map<string, { title: string; args: string[] }>()
+  /** The plugin command pnpm last blocked — on build scripts or too-new versions — rerun once decided. */
+  private readonly blockedInstalls = new Map<string, { title: string; commands: string[][] }>()
+  /** Removals queued or running per profile; `names` feeds the UI, `queued` the next run. */
+  private readonly removals = new Map<string, { names: string[]; queued: string[]; running: boolean }>()
+  /** Versions the last pnpm run refused as too new, per profile. */
+  private readonly releaseAgeHolds = new Map<string, ReleaseAgeHold[]>()
+  /** `dsh plugin` runs in flight; a quit waits for them. */
+  private pnpmRuns = 0
   /** Install requests waiting to join the next pnpm run for a profile. */
   private readonly installBatches = new Map<string, { plans: InstallPlan[]; waiters: Array<{ resolve: () => void; reject: (reason: unknown) => void }>; running: boolean }>()
   private setupRun: Promise<void> | null = null
@@ -152,6 +159,21 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
     if (this.updateTimer !== null) clearInterval(this.updateTimer)
     if (this.stateTimer !== null) clearTimeout(this.stateTimer)
     await this.supervisor.stop()
+    await this.whenIdle(60_000)
+  }
+
+  /**
+   * pnpm work a quit would cut off halfway: a run in flight, or an uninstall whose bundle is
+   * already off. Downloads and index builds simply start over next time.
+   */
+  get hasPendingWork(): boolean {
+    return this.pnpmRuns > 0 || [...this.removals.values()].some(batch => batch.running)
+  }
+
+  /** Resolves once queued background work has finished, or after `timeoutMs`. */
+  async whenIdle(timeoutMs = 120_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (this.hasPendingWork && Date.now() < deadline) await sleep(200)
   }
 
   get isRunning(): boolean {
@@ -582,10 +604,17 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
 
   async getProfile(name: string): Promise<ProfileDetail> {
     const install = this.active
-    return readProfileDetail(this.dshHome, name, {
+    const detail = await readProfileDetail(this.dshHome, name, {
       dshVersion: install?.version ?? null,
       installation: install === null ? [] : await this.installationBundles(install),
     })
+    const removing = this.removals.get(name)?.names ?? []
+    return {
+      ...detail,
+      // A plugin on its way out is off even before the background run has touched the manifest.
+      plugins: detail.plugins.map(plugin => (removing.includes(plugin.name) ? { ...plugin, removing: true, enabled: false } : plugin)),
+      releaseAgeHolds: this.releaseAgeHolds.get(name) ?? [],
+    }
   }
 
   private installationBundles(install: DshInstall): Promise<InstallationBundle[]> {
@@ -609,10 +638,13 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
       await this.tasks.run(title, async (task) => {
         const commands = typeof build === 'function' ? build(task) : build
         const env = await this.toolEnv(runtime)
-        for (const args of commands) {
+        let trustRounds = 0
+        for (let index = 0; index < commands.length; index += 1) {
+          const args = commands[index]
           task.log(`> dsh plugin --profile ${profile} ${args.join(' ')}\n`)
           task.progress(null, `pnpm ${args[0]} 进行中`)
           let timeouts = 0
+          this.pnpmRuns += 1
           const result = await run(runtime.node, [dshBin, 'plugin', '--profile', profile, ...args], {
             cwd: this.paths.root,
             env,
@@ -623,15 +655,45 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
               if (detail !== null) task.progress(null, detail)
               timeouts += text.match(/ETIMEDOUT/g)?.length ?? 0
             },
+          }).finally(() => {
+            this.pnpmRuns -= 1
           })
           if (timeouts >= 3 && this.settings.mirror !== 'official') {
             this.notice('warning', `下载源超时 ${timeouts} 次，安装会变慢；可在设置里换个下载源`)
           }
-          if (result.code === 0) continue
+          if (result.code === 0) {
+            this.releaseAgeHolds.delete(profile)
+            continue
+          }
+          // A retry resumes from the command that failed, not just that one command.
+          const remaining = { title, commands: commands.slice(index) }
+          // pnpm 11 re-verifies the whole lockfile on every run — an uninstall too — and fails when an
+          // entry younger than its release-age window is missing from minimumReleaseAgeExclude, e.g.
+          // one written by a pnpm without that check. Out of the box pnpm records versions it resolves
+          // itself the same way, so finish that for it; in strict mode the call stays with the user.
+          const holds = isReleaseAgeBlocked(result.output) ? parseReleaseAgeHolds(result.output) : []
+          if (holds.length > 0) {
+            if (trustRounds < 3 && !(await releaseAgeStrict(dir, env))) {
+              trustRounds += 1
+              const added = await trustReleaseAge(dir, holds)
+              if (added > 0) {
+                task.log(`\n按 pnpm 默认策略信任 ${added} 个刚发布的版本（记入 minimumReleaseAgeExclude）后重试：${holds.map(hold => `${hold.name}@${hold.version}`).join('、')}\n\n`)
+                this.notice('info', `锁文件里有 ${added} 个发布不满 ${formatReleaseAgeWindow(releaseAgeWindowHours(result.output))}的版本，已按 pnpm 默认策略信任并继续，详情见任务日志`)
+                index -= 1
+                continue
+              }
+            }
+            this.releaseAgeHolds.set(profile, holds)
+            this.blockedInstalls.set(profile, remaining)
+            const window = releaseAgeWindowHours(result.output)
+            const hours = hoursUntilCleared(holds, Date.now(), window)
+            const wait = hours === null ? '稍后再试' : hours === 0 ? '现在重试即可' : `约 ${hours} 小时后可以直接安装`
+            throw new Error(`pnpm 拒绝安装发布不满 ${formatReleaseAgeWindow(window)}的版本（${holds.length} 个），${wait}；也可以在插件页信任这些版本并重试`)
+          }
           // Only this run's output decides: pnpm-workspace.yaml keeps undecided names from earlier
           // attempts too, and attributing those to every later failure hides the real error.
           if (isBuildBlocked(result.output)) {
-            if (args[0] === 'add') this.blockedInstalls.set(profile, { title, args })
+            this.blockedInstalls.set(profile, remaining)
             const pending = await readPendingBuilds(dir)
             const names = pending.length > 0 ? `（${pending.join('、')}）` : ''
             throw new Error(`pnpm 拒绝运行依赖的构建脚本${names}。确认来源可信后，可在插件页“允许构建”并自动重试`)
@@ -726,8 +788,55 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
     }
   }
 
+  /**
+   * Uninstalling returns at once and the `pnpm remove` runs in the background, so the page never
+   * waits on pnpm — or on the profile lock another run may hold. Removals queued meanwhile share
+   * one run.
+   */
   async removePlugin(profile: string, name: string): Promise<void> {
-    await this.pluginCommand(profile, `卸载插件 ${name}`, [['remove', name]])
+    await this.ready()
+    const batch = this.removals.get(profile) ?? { names: [], queued: [], running: false }
+    if (!batch.names.includes(name)) {
+      batch.names.push(name)
+      batch.queued.push(name)
+    }
+    this.removals.set(profile, batch)
+    if (this.supervisor.running && this.supervisor.status.profile === profile) this.restartRequired = true
+    this.send({ type: 'plugins-changed', profile })
+    if (!batch.running) {
+      batch.running = true
+      void this.flushRemovals(profile)
+    }
+  }
+
+  private async flushRemovals(profile: string): Promise<void> {
+    const batch = this.removals.get(profile)
+    if (batch === undefined) return
+    const dir = this.profileDir(profile)
+    while (batch.queued.length > 0) {
+      // Off the layer stack first, so a restart — or a quit — before pnpm is done leaves it disabled.
+      let disabled = false
+      for (const name of batch.queued) disabled = (await setBundleEnabled(dir, name, false).catch(() => false)) || disabled
+      if (disabled) this.send({ type: 'plugins-changed', profile })
+      let names: string[] = []
+      try {
+        await this.pluginCommand(profile, '卸载插件', (task) => {
+          names = batch.queued.splice(0)
+          task.title(names.length === 1 ? `卸载插件 ${names[0]}` : `卸载 ${names.length} 个插件`)
+          return [['remove', ...names]]
+        })
+        this.notice('success', names.length === 1 ? `已卸载 ${names[0]}` : `已卸载 ${names.length} 个插件`)
+      } catch (error) {
+        // Failing before the task ever started (no runtime, runner closed) must still drain the queue.
+        if (names.length === 0) names = batch.queued.splice(0)
+        this.notice('error', `卸载 ${names.join('、')} 失败：${errorMessage(error)}（插件已停用）`)
+      } finally {
+        batch.names = batch.names.filter(name => !names.includes(name))
+        this.send({ type: 'plugins-changed', profile })
+      }
+    }
+    batch.running = false
+    this.removals.delete(profile)
   }
 
   async checkPluginUpdates(profile: string): Promise<PluginUpdateCheck> {
@@ -757,13 +866,35 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
     this.scheduleState()
   }
 
+  async trustReleaseAge(profile: string): Promise<void> {
+    const holds = this.releaseAgeHolds.get(profile) ?? []
+    if (holds.length === 0) throw new Error('没有等待信任的版本')
+    await trustReleaseAge(this.profileDir(profile), holds)
+    this.releaseAgeHolds.delete(profile)
+    this.send({ type: 'plugins-changed', profile })
+    const blocked = this.blockedInstalls.get(profile)
+    if (blocked === undefined) return
+    this.blockedInstalls.delete(profile)
+    await this.retryBlocked(profile, blocked)
+  }
+
   async decideBuilds(profile: string, names: string[], allow: boolean): Promise<void> {
     await decideBuilds(this.profileDir(profile), names, allow)
     this.send({ type: 'plugins-changed', profile })
     const blocked = this.blockedInstalls.get(profile)
     if (blocked === undefined) return
     this.blockedInstalls.delete(profile)
-    await this.pluginCommand(profile, `${blocked.title}（重试）`, [blocked.args])
+    await this.retryBlocked(profile, blocked)
+  }
+
+  /** Rerun what a trust or build decision unblocked; an uninstall goes back through its queue. */
+  private async retryBlocked(profile: string, blocked: { title: string; commands: string[][] }): Promise<void> {
+    const [first] = blocked.commands
+    if (blocked.commands.length === 1 && first[0] === 'remove') {
+      for (const name of first.slice(1)) await this.removePlugin(profile, name)
+      return
+    }
+    await this.pluginCommand(profile, `${blocked.title}（重试）`, blocked.commands)
   }
 
   // ---- diagnostics ----
@@ -867,6 +998,8 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
 
   /** Rebuild the local plugin index. Searches also refresh it in the background when it ages out. */
   async refreshMarketIndex(): Promise<void> {
+    // Network only, so it never waits behind a pnpm run: the market used to sit on its first
+    // "building the index" screen for as long as a plugin install took.
     await this.tasks.run('更新插件索引', async (task) => {
       task.progress(null, '正在读取 npm 插件列表')
       const index = await this.market.refresh({
@@ -874,7 +1007,7 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
         onProgress: (fetched, total) => task.progress(total > 0 ? fetched / total : null, `已收录 ${fetched} / ${total} 个插件`),
       })
       this.notice('success', `插件索引已更新：共 ${index.entries.length} 个插件`)
-    })
+    }, { parallel: true })
   }
 
   previewPackage(spec: string): Promise<PackagePreview> {

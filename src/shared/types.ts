@@ -144,6 +144,15 @@ export interface PluginInfo {
   official: boolean
   compat: Compat
   compatNote: string | null
+  /** Queued or running `pnpm remove`; the bundle is already off. */
+  removing: boolean
+}
+
+/** A version pnpm refused because it was published too recently. */
+export interface ReleaseAgeHold {
+  name: string
+  version: string
+  publishedAt: string | null
 }
 
 export interface BuiltinBundle {
@@ -171,6 +180,8 @@ export interface ProfileDetail {
   plugins: PluginInfo[]
   /** Dependencies whose build scripts pnpm blocked, awaiting approval. */
   pendingBuilds: string[]
+  /** Versions the last pnpm run refused as too new, awaiting trust or time. */
+  releaseAgeHolds: ReleaseAgeHold[]
 }
 
 export interface PluginUpdate {

@@ -54,6 +54,29 @@ describe('task runner', () => {
     expect(runner.list().map(task => task.status)).toEqual(['cancelled', 'cancelled'])
   })
 
+  it('starts parallel work at once, beside the queue', async () => {
+    const runner = new TaskRunner()
+    const order: string[] = []
+    const slow = runner.run('pnpm', async () => {
+      await sleep(50)
+      order.push('pnpm')
+    })
+    const index = runner.run('index', async () => {
+      order.push('index')
+    }, { parallel: true })
+    await Promise.all([slow, index])
+    expect(order).toEqual(['index', 'pnpm'])
+    // Closing cancels parallel work too, and still waits for it to wind down.
+    let finished = false
+    const late = runner.run('late', async () => {
+      await sleep(30)
+      finished = true
+    }, { parallel: true })
+    await runner.close()
+    expect(finished).toBe(true)
+    await expect(late).rejects.toThrow()
+  })
+
   it('records failures with their log', async () => {
     const runner = new TaskRunner()
     await expect(runner.run('x', async (task) => {

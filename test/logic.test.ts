@@ -232,7 +232,7 @@ describe('plugin update checks', () => {
   }
   const plugin = (name: string, version: string, extra: Partial<PluginInfo> = {}): PluginInfo => ({
     name, spec: `^${version}`, source: 'registry', version, description: '', homepage: null, bundle: true, enabled: true,
-    official: name.startsWith('@deepseek-ai/'), compat: 'unknown', compatNote: null, ...extra,
+    official: name.startsWith('@deepseek-ai/'), compat: 'unknown', compatNote: null, removing: false, ...extra,
   })
 
   it('targets the dsh version for official packages and latest for community ones', async () => {

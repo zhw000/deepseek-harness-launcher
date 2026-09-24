@@ -147,6 +147,7 @@ export function MarketPage() {
   const [installing, setInstalling] = useState<string | null>(null)
   const [busy, run] = useAction()
   const ready = state.settings.activeVersion !== null
+  const indexing = state.tasks.some(task => task.title === '更新插件索引' && task.endedAt === null)
 
   const load = useCallback(async (query: typeof request, from: number) => {
     setLoading(true)
@@ -295,7 +296,7 @@ export function MarketPage() {
           <MarketCard key={item.name} item={item} installed={installed.has(item.name)} disabled={!ready} onInstall={() => setInstalling(item.name)} />
         ))}
       </div>
-      {loading && <div className="empty"><Spinner />{page === null ? '首次使用需要建立插件索引，请稍候…' : ''}</div>}
+      {loading && <div className="empty"><Spinner />{page === null ? (indexing ? '正在建立插件索引，首次使用要多等一会…' : '正在加载插件…') : ''}</div>}
       {!loading && error === null && items.length === 0 && (
         <div className="card empty">
           <p>没有匹配的插件。</p>

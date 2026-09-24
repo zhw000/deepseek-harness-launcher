@@ -56,7 +56,7 @@ const MARKET: MarketItem[] = [
 function plugin(name: string, version: string | null, extra: Partial<PluginInfo> = {}): PluginInfo {
   return {
     name, spec: version ? `^${version}` : '^1.0.0', source: 'registry', version, description: '', homepage: null,
-    bundle: true, enabled: true, official: name.startsWith('@deepseek-ai/'), compat: 'ok', compatNote: null, ...extra,
+    bundle: true, enabled: true, official: name.startsWith('@deepseek-ai/'), compat: 'ok', compatNote: null, removing: false, ...extra,
   }
 }
 
@@ -96,7 +96,7 @@ export function createMockBridge(): LauncherBridge {
   }
   const profiles: Record<string, ProfileDetail> = {
     web: {
-      name: 'web', dir: `${HOME}/.dsh/profiles/web`, exists: true, pendingBuilds: [],
+      name: 'web', dir: `${HOME}/.dsh/profiles/web`, exists: true, pendingBuilds: [], releaseAgeHolds: [],
       builtins: [
         { name: '@deepseek-ai/dsh-base', description: 'Base bundle: models, tools, sessions and settings', enabled: true, optional: false },
         { name: '@deepseek-ai/dsh-web-app', description: 'The browser UI app bundle', enabled: true, optional: false },
@@ -110,7 +110,7 @@ export function createMockBridge(): LauncherBridge {
         plugin('sample-helper-lib', '2.1.0', { bundle: false, enabled: false, description: 'A plain library dependency' }),
       ],
     },
-    work: { name: 'work', dir: `${HOME}/.dsh/profiles/work`, exists: true, pendingBuilds: [], builtins: [], plugins: [] },
+    work: { name: 'work', dir: `${HOME}/.dsh/profiles/work`, exists: true, pendingBuilds: [], releaseAgeHolds: [], builtins: [], plugins: [] },
   }
 
   const refresh = () => {
@@ -140,13 +140,15 @@ export function createMockBridge(): LauncherBridge {
     refresh()
     if (failure !== undefined) throw new Error(failure)
   }
+  const trusted = new Set<string>()
+  let held: string | null = null
   const changed = (profile: string) => {
     if (state.process.phase === 'running' && state.process.profile === profile) state.restartRequired = true
     emit({ type: 'plugins-changed', profile })
     refresh()
   }
   const detail = (name: string) => profiles[name]
-    ?? (profiles[name] = { name, dir: `${HOME}/.dsh/profiles/${name}`, exists: false, pendingBuilds: [], builtins: [], plugins: [] })
+    ?? (profiles[name] = { name, dir: `${HOME}/.dsh/profiles/${name}`, exists: false, pendingBuilds: [], releaseAgeHolds: [], builtins: [], plugins: [] })
 
   const bridge: LauncherBridge = {
     getState: async () => {
@@ -244,6 +246,13 @@ export function createMockBridge(): LauncherBridge {
       return { updates, failures }
     },
     installPlugin: async (name, spec) => {
+      // "fresh" plays a strict-mode profile holding a version published three hours ago.
+      if (spec.includes('fresh') && !trusted.has(spec)) {
+        detail(name).releaseAgeHolds = [{ name: spec, version: '2.0.1', publishedAt: new Date(Date.now() - 3 * 3_600_000).toISOString() }]
+        held = spec
+        changed(name)
+        await task(`安装插件 ${spec}`, 12, 140, 'pnpm 拒绝安装发布不满 24 小时的版本（1 个），约 21 小时后可以直接安装；也可以在插件页信任这些版本并重试')
+      }
       if (spec.includes('native')) {
         detail(name).pendingBuilds = ['sample-native-addon']
         changed(name)
@@ -257,9 +266,16 @@ export function createMockBridge(): LauncherBridge {
       changed(name)
     },
     removePlugin: async (name, pkg) => {
-      await task(`卸载插件 ${pkg}`, 6)
-      detail(name).plugins = detail(name).plugins.filter(item => item.name !== pkg)
+      // Like the service: the bundle goes off and the call returns; pnpm runs in the background.
+      const target = detail(name).plugins.find(item => item.name === pkg)
+      if (target === undefined) return
+      target.enabled = false
+      target.removing = true
       changed(name)
+      void task(`卸载插件 ${pkg}`, 16).then(() => {
+        detail(name).plugins = detail(name).plugins.filter(item => item.name !== pkg)
+        changed(name)
+      })
     },
     updatePlugins: async (name, updates) => {
       await task(updates.length === 1 ? `更新插件 ${updates[0].name}` : `更新 ${updates.length} 个插件`, 10)
@@ -273,6 +289,15 @@ export function createMockBridge(): LauncherBridge {
       const target = detail(name).plugins.find(item => item.name === pkg) ?? detail(name).builtins.find(item => item.name === pkg)
       if (target) target.enabled = enabled
       changed(name)
+    },
+    trustReleaseAge: async (name) => {
+      detail(name).releaseAgeHolds = []
+      changed(name)
+      if (held === null) return
+      trusted.add(held)
+      const spec = held
+      held = null
+      await bridge.installPlugin(name, spec)
     },
     decideBuilds: async (name) => {
       detail(name).pendingBuilds = []

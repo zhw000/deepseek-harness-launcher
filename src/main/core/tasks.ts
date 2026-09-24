@@ -24,11 +24,13 @@ type TaskEvents = { change: []; log: [id: string, text: string] }
 /**
  * Serializes every mutating operation (downloads, installs, pnpm runs) through one
  * queue so they never race on the same files. Work must not queue another task and
- * wait for it, or the queue deadlocks.
+ * wait for it, or the queue deadlocks. Work that touches none of those files may run
+ * `parallel`: it shows up in the list but never waits behind a pnpm run.
  */
 export class TaskRunner extends EventEmitter<TaskEvents> {
   private readonly records = new Map<string, TaskRecord>()
   private queue: Promise<unknown> = Promise.resolve()
+  private readonly parallel = new Set<Promise<unknown>>()
   private counter = 0
   private closed = false
 
@@ -39,6 +41,7 @@ export class TaskRunner extends EventEmitter<TaskEvents> {
       if (record.info.endedAt === null) record.controller.abort(new CancelledError())
     }
     await this.queue
+    await Promise.all(this.parallel)
   }
 
   /** Newest first. */
@@ -54,7 +57,7 @@ export class TaskRunner extends EventEmitter<TaskEvents> {
     this.records.get(id)?.controller.abort(new CancelledError())
   }
 
-  run<T>(title: string, work: (task: TaskHandle) => Promise<T>): Promise<T> {
+  run<T>(title: string, work: (task: TaskHandle) => Promise<T>, options: { parallel?: boolean } = {}): Promise<T> {
     if (this.closed) return Promise.reject(new CancelledError())
     const record: TaskRecord = {
       info: {
@@ -72,6 +75,13 @@ export class TaskRunner extends EventEmitter<TaskEvents> {
     }
     this.records.set(record.info.id, record)
     this.emit('change')
+    if (options.parallel === true) {
+      const result = this.execute(record, work)
+      const settled = result.catch(() => undefined)
+      this.parallel.add(settled)
+      void settled.then(() => this.parallel.delete(settled))
+      return result
+    }
     const result = this.queue.then(() => this.execute(record, work))
     this.queue = result.catch(() => undefined)
     return result

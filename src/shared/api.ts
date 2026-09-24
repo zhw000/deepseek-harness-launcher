@@ -36,6 +36,8 @@ export interface LauncherApi {
   setBundleEnabled(profile: string, name: string, enabled: boolean): Promise<void>
   /** Allow or decline the build scripts pnpm blocked; either decision unblocks later installs. */
   decideBuilds(profile: string, names: string[], allow: boolean): Promise<void>
+  /** Exempt the versions pnpm held back as too new, then retry the blocked operation. */
+  trustReleaseAge(profile: string): Promise<void>
 
   searchMarket(query: MarketQuery): Promise<MarketPage>
   /** Rebuild the local plugin index from the registry. */
@@ -69,7 +71,7 @@ export const API_METHODS = [
   'setup', 'checkUpdates', 'installVersion', 'activateVersion', 'removeVersion', 'getReleaseNotes',
   'start', 'stop', 'restart', 'openWebUI',
   'listProfiles', 'createProfile', 'getProfile', 'checkPluginUpdates', 'installPlugin', 'removePlugin',
-  'updatePlugins', 'setBundleEnabled', 'decideBuilds',
+  'updatePlugins', 'setBundleEnabled', 'decideBuilds', 'trustReleaseAge',
   'searchMarket', 'refreshMarketIndex', 'previewPackage',
   'checkLauncherUpdate', 'runDoctor', 'testMirrors', 'exportPlugins', 'importPlugins',
   'updateSettings', 'cancelTask', 'pickDirectory', 'pickFile', 'openPath', 'openExternal',

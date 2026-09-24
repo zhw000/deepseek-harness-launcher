@@ -2,7 +2,7 @@ import {
   Box, CircleArrowUp, ExternalLink, FileDown, FileUp, FolderOpen, Package, PackagePlus, Plus, RefreshCw, Store, Trash2, TriangleAlert,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import type { PluginInfo, PluginUpdate, PluginUpdateCheck, ProfileDetail } from '../../../shared/types'
+import type { PluginInfo, PluginUpdate, PluginUpdateCheck, ProfileDetail, ReleaseAgeHold } from '../../../shared/types'
 import { api } from '../api'
 import { Banner, Field, Modal, Spinner, Switch } from '../components/ui'
 import { SOURCES } from '../format'
@@ -84,6 +84,7 @@ function PluginRow({ plugin, update, busy, onToggle, onUpdate, onRemove }: {
           {!plugin.bundle && plugin.version !== null && <span className="badge" title="没有声明 dsh.bundle，不会加入配置层">普通依赖</span>}
           {plugin.source !== 'registry' && <span className="badge">{SOURCES[plugin.source]}</span>}
           {plugin.version === null && <span className="badge danger">文件缺失</span>}
+          {plugin.removing && <span className="badge"><Spinner size={11} />卸载中</span>}
           {plugin.compat === 'warn' && <span className="badge warning" title={plugin.compatNote ?? ''}><TriangleAlert size={12} />可能不兼容</span>}
           {update && (
           <span className={`badge ${update.compat === 'warn' ? 'warning' : 'success'}`} title={update.compatNote ?? undefined}>
@@ -97,9 +98,9 @@ function PluginRow({ plugin, update, busy, onToggle, onUpdate, onRemove }: {
       {plugin.homepage && (
         <button type="button" className="btn ghost sm icon" title="主页" onClick={() => void attempt(() => api.openExternal(plugin.homepage!))}><ExternalLink size={14} /></button>
       )}
-      <button type="button" className="btn ghost sm icon danger" title="卸载" disabled={busy} onClick={onRemove}><Trash2 size={14} /></button>
+      <button type="button" className="btn ghost sm icon danger" title="卸载" disabled={busy || plugin.removing} onClick={onRemove}><Trash2 size={14} /></button>
       {plugin.bundle
-        ? <Switch on={plugin.enabled} disabled={busy} onChange={onToggle} label={`启用 ${plugin.name}`} />
+        ? <Switch on={plugin.enabled} disabled={busy || plugin.removing} onChange={onToggle} label={`启用 ${plugin.name}`} />
         : <span className="switch-slot" />}
     </div>
   )
@@ -161,9 +162,17 @@ export function PluginsPage() {
       confirmText: '卸载',
       danger: true,
     })
-    if (ok) await run(() => api.removePlugin(profile, plugin.name), `已卸载 ${plugin.name}`)
+    if (ok) await run(() => api.removePlugin(profile, plugin.name), `${plugin.name} 已停用，正在后台卸载`)
   }
   const toggle = (name: string, enabled: boolean) => void run(() => api.setBundleEnabled(profile, name, enabled))
+  const trust = async (holds: ReleaseAgeHold[]) => {
+    const ok = await store.ask({
+      title: '信任这些刚发布的版本？',
+      message: `${holds.map(hold => `${hold.name}@${hold.version}`).join('\n')}\n\npnpm 的发布时间保护（默认 24 小时）用来挡住“刚发布就被投毒”的包；这个配置开启了严格模式，所以要你来确认。信任后只豁免上面这些确切版本，它们以后的新版本仍要等满保护期。确认后会自动重试刚才被拦下的操作。`,
+      confirmText: '信任并重试',
+    })
+    if (ok) await run(() => api.trustReleaseAge(profile), '已信任并重试')
+  }
   const decide = async (names: string[], allow: boolean) => {
     const ok = await store.ask({
       title: allow ? '允许这些依赖运行构建脚本？' : '拒绝运行这些构建脚本？',
@@ -228,6 +237,12 @@ export function PluginsPage() {
         {check !== null && check.failures.length > 0 && (
           <Banner level="warning">
             {check.failures.length} 个插件无法检查更新：{check.failures.map(failure => `${failure.name}（${failure.error}）`).join('；')}
+          </Banner>
+        )}
+        {detail !== null && detail.releaseAgeHolds.length > 0 && (
+          <Banner level="warning" action={<button type="button" className="btn sm" disabled={busy} onClick={() => void trust(detail.releaseAgeHolds)}>信任并重试…</button>}>
+            pnpm 的发布时间保护拦下了这些刚发布的版本：<b className="mono">{detail.releaseAgeHolds.slice(0, 4).map(hold => `${hold.name}@${hold.version}`).join('、')}</b>
+            {detail.releaseAgeHolds.length > 4 && ` 等 ${detail.releaseAgeHolds.length} 个`}。可以等它们过了保护期再装，或信任这些确切版本。
           </Banner>
         )}
         {detail !== null && !detail.exists && (

@@ -1,7 +1,7 @@
 import { readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import semver from 'semver'
-import { isMap, isScalar, parseDocument, type Document } from 'yaml'
+import { isMap, isScalar, isSeq, parseDocument, type Document } from 'yaml'
 import type { BuiltinBundle, PluginInfo, ProfileDetail, ProfileSummary, SpecSource } from '../../shared/types'
 import { dshPackageDir } from './dsh-versions'
 import { profileDir, profilesDir } from './paths'
@@ -180,6 +180,71 @@ export function decideBuilds(dir: string, names: readonly string[], allow: boole
   })
 }
 
+/**
+ * Trust exact versions pnpm held back for being too new, by adding `name@version` to
+ * `minimumReleaseAgeExclude` — the same entries pnpm writes itself in its default mode.
+ * Only those versions are exempt; later releases still wait out the window.
+ */
+export function trustReleaseAge(dir: string, holds: ReadonlyArray<{ name: string; version: string }>): Promise<number> {
+  return withProfileLock(dir, async () => {
+    const path = join(dir, 'pnpm-workspace.yaml')
+    let text: string
+    try {
+      text = await readFile(path, 'utf8')
+    } catch {
+      throw new Error('配置目录中没有 pnpm-workspace.yaml')
+    }
+    const document = parseDocument(text)
+    if (document.errors.length > 0) throw document.errors[0]
+    const current = document.get('minimumReleaseAgeExclude')
+    if (current !== undefined && !isSeq(current)) throw new Error('minimumReleaseAgeExclude 必须是列表')
+    const existing = isSeq(current) ? current.items.map(item => (isScalar(item) ? String(item.value) : '')) : []
+    const additions = [...new Set(holds
+      .filter(hold => !existing.some(entry => excludeCovers(entry, hold.name, hold.version)))
+      .map(hold => `${hold.name}@${hold.version}`))]
+    if (additions.length === 0) return 0
+    if (isSeq(current)) {
+      for (const entry of additions) current.add(document.createNode(entry))
+    } else {
+      document.set('minimumReleaseAgeExclude', document.createNode(additions))
+    }
+    await writeFileAtomic(path, String(document))
+    return additions.length
+  })
+}
+
+/** Whether an exclude entry — a bare name or `name@1.0.0 || 1.0.1` — already covers this version. */
+function excludeCovers(entry: string, name: string, version: string): boolean {
+  // Negations and globs are left to pnpm; an extra exact entry next to them is harmless.
+  if (entry.startsWith('!') || entry.includes('*')) return false
+  const at = entry.startsWith('@') ? entry.indexOf('@', 1) : entry.indexOf('@')
+  if (at === -1) return entry === name
+  return entry.slice(0, at) === name && entry.slice(at + 1).split('||').some(item => item.trim() === version)
+}
+
+/**
+ * Whether pnpm wants a person to approve too-new versions in this profile. Out of the box pnpm
+ * trusts them itself and records them in `minimumReleaseAgeExclude`; `minimumReleaseAgeStrict`,
+ * which setting `minimumReleaseAge` explicitly also switches on, makes it ask instead.
+ */
+export async function releaseAgeStrict(dir: string, env: NodeJS.ProcessEnv = process.env): Promise<boolean> {
+  const settings = new Map<string, unknown>()
+  for (const [key, value] of Object.entries(env)) {
+    const match = /^pnpm_config_minimum_release_age(_strict)?$/i.exec(key)
+    if (match !== null && value !== undefined && value !== '') settings.set(match[1] === undefined ? 'age' : 'strict', value)
+  }
+  const text = await readFile(join(dir, 'pnpm-workspace.yaml'), 'utf8').catch(() => '')
+  const config: unknown = parseDocument(text).toJS()
+  if (config !== null && typeof config === 'object') {
+    const record = config as Record<string, unknown>
+    if (record.minimumReleaseAge != null) settings.set('age', record.minimumReleaseAge)
+    if (record.minimumReleaseAgeStrict != null) settings.set('strict', record.minimumReleaseAgeStrict)
+  }
+  const strict = settings.get('strict')
+  if (strict !== undefined) return strict === true || String(strict).toLowerCase() === 'true'
+  return settings.has('age')
+}
+
 export function classifySpec(spec: string): SpecSource {
   const value = spec.trim()
   if (/^(link|file):/i.test(value)) return /\.(tgz|tar\.gz)$/i.test(value) ? 'tarball' : 'local'
@@ -233,6 +298,7 @@ export async function readProfileDetail(dshHome: string, name: string, context: 
       official: pkg.startsWith('@deepseek-ai/'),
       compat,
       compatNote: note,
+      removing: false,
     }
   })
   const builtins: BuiltinBundle[] = []
@@ -252,5 +318,6 @@ export async function readProfileDetail(dshHome: string, name: string, context: 
     builtins,
     plugins: plugins.sort((a, b) => a.name.localeCompare(b.name)),
     pendingBuilds: manifest === null ? [] : await readPendingBuilds(dir),
+    releaseAgeHolds: [],
   }
 }

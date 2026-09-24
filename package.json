@@ -1,7 +1,7 @@
 {
   "name": "dsh-launcher",
   "productName": "DSH Launcher",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "DeepSeek Harness 启动器：自动下载运行时与 dsh、版本更新、插件安装与管理",
   "main": "./out/main/index.js",
   "author": "zhw000",
