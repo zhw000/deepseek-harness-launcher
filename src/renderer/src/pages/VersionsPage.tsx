@@ -55,6 +55,22 @@ export function VersionsPage() {
   const remoteVersions = remote?.versions ?? []
   const shown = showAll ? remoteVersions : remoteVersions.slice(0, 8)
 
+  /** Switch — after asking the launch profile's plugins whether they accept `version`. */
+  const switchTo = async (version: string, install: boolean) => {
+    const profile = settings.launch.profile
+    const issues = await api.checkPluginCompat(profile, version).catch(() => [])
+    if (issues.length > 0) {
+      const ok = await store.ask({
+        title: `切换到 dsh ${version}？`,
+        message: `配置 ${profile} 里有 ${issues.length} 个插件不支持这个版本：\n\n${issues.map(issue => `${issue.name}：${issue.note}`).join('\n')}\n\n切换后它们可能在浏览器里报错。`,
+        confirmText: '仍然切换',
+        danger: true,
+      })
+      if (!ok) return
+    }
+    await run(() => (install ? api.installVersion(version, true) : api.activateVersion(version)), `已切换到 dsh ${version}`)
+  }
+
   const remove = async (version: string) => {
     const ok = await store.ask({
       title: `删除 dsh ${version}？`,
@@ -95,7 +111,7 @@ export function VersionsPage() {
         {update
           ? (
             <Banner level="info" action={(
-              <button type="button" className="btn sm primary" disabled={busy} onClick={() => void run(() => api.installVersion(update, true), `已切换到 dsh ${update}`)}>
+              <button type="button" className="btn sm primary" disabled={busy} onClick={() => void switchTo(update, true)}>
                 <Download size={14} />{installedVersions.has(update) ? '切换' : '下载并切换'}
               </button>
             )}>
@@ -142,7 +158,7 @@ export function VersionsPage() {
               </div>
               <button type="button" className="btn ghost sm" onClick={() => setNotesFor(item.version)}><FileText size={14} />更新日志</button>
               {!active && (
-                <button type="button" className="btn sm" disabled={busy} onClick={() => void run(() => api.activateVersion(item.version), `已切换到 ${item.version}`)}>切换</button>
+                <button type="button" className="btn sm" disabled={busy} onClick={() => void switchTo(item.version, false)}>切换</button>
               )}
               {!active && !running && (
                 <button type="button" className="btn ghost sm icon danger" title="删除" disabled={busy} onClick={() => void remove(item.version)}><Trash2 size={14} /></button>
@@ -170,7 +186,7 @@ export function VersionsPage() {
               : (
                 <>
                   <button type="button" className="btn sm" disabled={busy} onClick={() => void run(() => api.installVersion(item.version, false), `已安装 ${item.version}`)}>安装</button>
-                  <button type="button" className="btn sm primary" disabled={busy} onClick={() => void run(() => api.installVersion(item.version, true), `已切换到 ${item.version}`)}>安装并切换</button>
+                  <button type="button" className="btn sm primary" disabled={busy} onClick={() => void switchTo(item.version, true)}>安装并切换</button>
                 </>
               )}
           </div>

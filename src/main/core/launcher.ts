@@ -4,12 +4,13 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type {
   AppState, LauncherEvent, LogLine, MarketPage, NoticeLevel, PackagePreview, PluginUpdate, PluginUpdateCheck,
-  CheckFix, CheckStatus, DoctorCheck, DoctorReport, ImportResult, LauncherRelease, MarketQuery, MirrorTiming, PluginExport, ProfileDetail, ProfileSummary, ReleaseAgeHold, RemoteInfo, Settings, SettingsPatch,
+  CheckFix, CheckStatus, DoctorCheck, DoctorReport, ImportResult, LauncherRelease, MarketQuery, MirrorTiming, PluginCompatIssue, PluginExport, ProfileDetail, ProfileSummary, ReleaseAgeHold, RemoteInfo, Settings, SettingsPatch,
 } from '../../shared/types'
 import {
   cleanupVersionsRoot, DSH_PACKAGE, dshBinPath, installDsh, listInstalled, newerOnChannel, pruneCandidates, removeDsh,
   toRemoteInfo, type DshInstall,
 } from './dsh-versions'
+import { versionHost, type DshHost } from './compat'
 import { getJson, HttpError, type FetchFn } from './http'
 import { RELEASES_API, resolveEndpoints, type Endpoints } from './mirrors'
 import { DSH_NODE_RANGE, findInstalledNode, installNode, nodeBinDir, type NodeRuntime } from './node-runtime'
@@ -27,8 +28,8 @@ import { installedPnpmVersion, installPnpm, pnpmCliPath, PNPM_SPEC, writeShims }
 import { childEnvironment } from './environment'
 import { appendPath, prependPath, run } from './proc'
 import {
-  decideBuilds, installationBundles, listProfiles, readPendingBuilds, readProfileDetail, releaseAgeStrict, setBundleEnabled,
-  trustReleaseAge, validateProfileName, type InstallationBundle,
+  decideBuilds, installationBundles, installationPackages, listProfiles, profileCompatIssues, readPendingBuilds, readProfileDetail,
+  releaseAgeStrict, setBundleEnabled, trustReleaseAge, validateProfileName, type InstallationBundle,
 } from './profiles'
 import { fetchPackument } from './registry'
 import { applySettingsPatch, defaultSettings, loadSettings, saveSettings, type SecretCodec } from './settings'
@@ -107,6 +108,8 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
   private readonly tasks = new TaskRunner()
   private readonly supervisor = new DshSupervisor()
   private readonly bundleCache = new Map<string, Promise<InstallationBundle[]>>()
+  /** What each installed dsh version ships, keyed by its directory. */
+  private readonly hosts = new Map<string, Promise<DshHost>>()
   private readonly releaseNotes = new Map<string, string | null>()
   /** The plugin command pnpm last blocked — on build scripts or too-new versions — rerun once decided. */
   private readonly blockedInstalls = new Map<string, { title: string; commands: string[][] }>()
@@ -137,7 +140,7 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
       fetch: this.hooks.fetch,
       registry: () => this.endpoints.registry,
       cacheDir: this.paths.cache,
-      dshVersion: () => this.active?.version ?? null,
+      dshHost: () => this.activeHost(),
     })
     this.tasks.on('change', () => this.scheduleState())
     this.tasks.on('log', (id, text) => this.send({ type: 'task-log', id, text }))
@@ -605,8 +608,9 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
   async getProfile(name: string): Promise<ProfileDetail> {
     const install = this.active
     const detail = await readProfileDetail(this.dshHome, name, {
-      dshVersion: install?.version ?? null,
+      host: install === null ? null : await this.hostOf(install),
       installation: install === null ? [] : await this.installationBundles(install),
+      published: this.remote === null ? undefined : { versions: this.remote.versions.map(item => item.version), tags: this.remote.distTags },
     })
     const removing = this.removals.get(name)?.names ?? []
     return {
@@ -615,6 +619,33 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
       plugins: detail.plugins.map(plugin => (removing.includes(plugin.name) ? { ...plugin, removing: true, enabled: false } : plugin)),
       releaseAgeHolds: this.releaseAgeHolds.get(name) ?? [],
     }
+  }
+
+  /** The installation plugins run against: its version and the `@deepseek-ai/*` packages it ships. */
+  private hostOf(install: DshInstall): Promise<DshHost> {
+    let cached = this.hosts.get(install.dir)
+    if (cached === undefined) {
+      cached = installationPackages(install.dir)
+        .catch(() => new Map<string, string>())
+        .then(packages => ({ version: install.version, packages }))
+      this.hosts.set(install.dir, cached)
+    }
+    return cached
+  }
+
+  private async activeHost(): Promise<DshHost | null> {
+    const install = this.active
+    return install === null ? null : this.hostOf(install)
+  }
+
+  /**
+   * Installed plugins of a profile that would reject `version` — asked before switching to it,
+   * so a plugin that needs another dsh shows up here rather than as an error in the browser.
+   */
+  async checkPluginCompat(profile: string, version: string): Promise<PluginCompatIssue[]> {
+    const install = this.installed.find(item => item.version === version)
+    const host = install === undefined ? versionHost(version) : await this.hostOf(install)
+    return profileCompatIssues(this.dshHome, profile, host)
   }
 
   private installationBundles(install: DshInstall): Promise<InstallationBundle[]> {
@@ -841,7 +872,7 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
 
   async checkPluginUpdates(profile: string): Promise<PluginUpdateCheck> {
     const detail = await this.getProfile(profile)
-    return findPluginUpdates(this.hooks.fetch, this.endpoints.registry, detail.plugins, this.active?.version ?? null)
+    return findPluginUpdates(this.hooks.fetch, this.endpoints.registry, detail.plugins, await this.activeHost())
   }
 
   async updatePlugins(profile: string, updates: PluginUpdate[]): Promise<void> {
@@ -979,10 +1010,18 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
       if (detail.pendingBuilds.length > 0) add('builds', '构建脚本', 'error', `待决定：${detail.pendingBuilds.join('、')}。决定之前这个配置下的所有安装都会失败`, 'plugins')
       else add('builds', '构建脚本', 'ok', '没有待决定的构建脚本')
       const missing = detail.plugins.filter(plugin => plugin.version === null)
-      const suspect = detail.plugins.filter(plugin => plugin.compat === 'warn')
-      if (missing.length > 0) add('plugins', '插件状态', 'error', `文件缺失：${missing.map(plugin => plugin.name).join('、')}`, 'plugins')
-      else if (suspect.length > 0) add('plugins', '插件状态', 'warn', `声明的版本范围不含当前 dsh：${suspect.map(plugin => plugin.name).join('、')}`, 'plugins')
-      else add('plugins', '插件状态', 'ok', detail.plugins.length > 0 ? `${detail.plugins.length} 个插件都正常` : '没有安装第三方插件')
+      if (missing.length > 0) add('plugins', '插件文件', 'error', `文件缺失：${missing.map(plugin => plugin.name).join('、')}`, 'plugins')
+      else add('plugins', '插件文件', 'ok', detail.plugins.length > 0 ? `${detail.plugins.length} 个插件的文件都在` : '没有安装第三方插件')
+      const active = this.active
+      const rejecting = detail.plugins.filter(plugin => plugin.compat === 'warn')
+      const undeclared = detail.plugins.filter(plugin => plugin.compat === 'unknown' && plugin.version !== null).length
+      const suggestion = detail.dshSuggestion
+      if (rejecting.length > 0) {
+        const hint = suggestion === null ? '' : `。切换到 dsh ${suggestion.version}${suggestion.tag === null ? '' : `（${suggestion.tag}）`}可以让已装插件都满足要求`
+        add('compat', '插件兼容性', 'warn', `${rejecting.map(plugin => `${plugin.name} ${plugin.compatNote}`).join('；')}${hint}`, suggestion === null ? 'plugins' : 'versions')
+      } else if (active !== null && detail.plugins.length > 0) {
+        add('compat', '插件兼容性', 'ok', `声明了版本范围的插件都兼容 dsh ${active.version}${undeclared > 0 ? `（${undeclared} 个没有声明）` : ''}`)
+      }
     }
 
     return { checkedAt: new Date().toISOString(), launcherVersion: this.options.launcherVersion, platform: `${this.platform}-${this.arch}`, checks }
@@ -1010,8 +1049,8 @@ export class LauncherService extends EventEmitter<ServiceEvents> {
     }, { parallel: true })
   }
 
-  previewPackage(spec: string): Promise<PackagePreview> {
-    return previewPackage(this.hooks.fetch, this.endpoints.registry, spec, this.active?.version ?? null)
+  async previewPackage(spec: string): Promise<PackagePreview> {
+    return previewPackage(this.hooks.fetch, this.endpoints.registry, spec, await this.activeHost())
   }
 
   // ---- settings ----

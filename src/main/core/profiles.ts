@@ -2,10 +2,11 @@ import { readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import semver from 'semver'
 import { isMap, isScalar, isSeq, parseDocument, type Document } from 'yaml'
-import type { BuiltinBundle, PluginInfo, ProfileDetail, ProfileSummary, SpecSource } from '../../shared/types'
+import type { BuiltinBundle, PluginCompatIssue, PluginInfo, ProfileDetail, ProfileSummary, SpecSource } from '../../shared/types'
+import { assessCompat, suggestDsh, type DshHost } from './compat'
 import { dshPackageDir } from './dsh-versions'
 import { profileDir, profilesDir } from './paths'
-import { compatibility, repositoryUrl, type VersionManifest } from './registry'
+import { repositoryUrl, type VersionManifest } from './registry'
 import { mapLimit, readJson, sleep, writeFileAtomic } from './util'
 
 /** Bundles that make up the shipped apps; they are not user-toggleable. */
@@ -274,19 +275,52 @@ export async function installationBundles(versionDir: string): Promise<Installat
   return bundles
 }
 
+/**
+ * The `@deepseek-ai/*` packages a dsh installation ships, name → version. Plugins resolve these
+ * peers from dsh at runtime, so their ranges are checked against these copies.
+ */
+export async function installationPackages(versionDir: string): Promise<Map<string, string>> {
+  const packages = new Map<string, string>()
+  for (const scope of [join(versionDir, 'node_modules', '@deepseek-ai'), join(dshPackageDir(versionDir), 'node_modules', '@deepseek-ai')]) {
+    const entries = await readdir(scope).catch(() => [] as string[])
+    const manifests = await mapLimit(entries, 16, entry => readJson<VersionManifest>(join(scope, entry, 'package.json')).catch(() => null))
+    for (const found of manifests) {
+      if (found?.name !== undefined && found.version !== undefined && !packages.has(found.name)) packages.set(found.name, found.version)
+    }
+  }
+  return packages
+}
+
 export interface DetailContext {
-  dshVersion: string | null
+  host: DshHost | null
   installation: readonly InstallationBundle[]
+  /** Published dsh versions, newest first, and their dist-tags: where to look for one the plugins accept. */
+  published?: { versions: readonly string[]; tags: Readonly<Record<string, string>> }
+}
+
+function installedManifest(dir: string, name: string): Promise<VersionManifest | null> {
+  return readJson<VersionManifest>(join(dir, 'node_modules', ...name.split('/'), 'package.json')).catch(() => null)
+}
+
+/** Plugins of a profile whose declared ranges reject `host`, phrased for "after switching to it". */
+export async function profileCompatIssues(dshHome: string, name: string, host: DshHost): Promise<PluginCompatIssue[]> {
+  const dir = profileDir(dshHome, name)
+  const names = Object.keys((await readProfileManifest(dir))?.dependencies ?? {})
+  const issues = await mapLimit(names, 8, async (pkg) => {
+    const { compat, needs } = assessCompat((await installedManifest(dir, pkg))?.peerDependencies, host)
+    return compat === 'warn' ? { name: pkg, note: needs.join('；') } : null
+  })
+  return issues.filter((issue): issue is PluginCompatIssue => issue !== null)
 }
 
 export async function readProfileDetail(dshHome: string, name: string, context: DetailContext): Promise<ProfileDetail> {
   const dir = profileDir(dshHome, name)
   const manifest = await readProfileManifest(dir)
   const bundles = manifest?.dsh?.profile?.bundles ?? SHIPPED_BUNDLES[name] ?? []
-  const plugins = await mapLimit(Object.entries(manifest?.dependencies ?? {}), 8, async ([pkg, spec]): Promise<PluginInfo> => {
-    const installed = await readJson<VersionManifest>(join(dir, 'node_modules', ...pkg.split('/'), 'package.json')).catch(() => null)
-    const { compat, note } = compatibility(installed?.peerDependencies, context.dshVersion)
-    return {
+  const assessed = await mapLimit(Object.entries(manifest?.dependencies ?? {}), 8, async ([pkg, spec]) => {
+    const installed = await installedManifest(dir, pkg)
+    const { compat, note, dshRanges } = assessCompat(installed?.peerDependencies, context.host)
+    const plugin: PluginInfo = {
       name: pkg,
       spec,
       source: classifySpec(spec),
@@ -300,7 +334,12 @@ export async function readProfileDetail(dshHome: string, name: string, context: 
       compatNote: note,
       removing: false,
     }
+    return { plugin, dshRanges }
   })
+  const plugins = assessed.map(item => item.plugin)
+  const current = context.host?.version
+  const rejected = current !== undefined
+    && assessed.some(item => item.dshRanges.some(range => !semver.satisfies(current, range, { includePrerelease: true })))
   const builtins: BuiltinBundle[] = []
   for (const bundle of context.installation) {
     const optional = !CORE_BUNDLES.includes(bundle.name)
@@ -319,5 +358,8 @@ export async function readProfileDetail(dshHome: string, name: string, context: 
     plugins: plugins.sort((a, b) => a.name.localeCompare(b.name)),
     pendingBuilds: manifest === null ? [] : await readPendingBuilds(dir),
     releaseAgeHolds: [],
+    dshSuggestion: current !== undefined && rejected && context.published !== undefined
+      ? suggestDsh(assessed.map(item => item.dshRanges), context.published.versions, context.published.tags, current)
+      : null,
   }
 }

@@ -142,10 +142,24 @@ export interface PluginInfo {
   /** Listed in `dsh.profile.bundles`. */
   enabled: boolean
   official: boolean
+  /** Whether its peer ranges on `@deepseek-ai/*` accept the active dsh. */
   compat: Compat
+  /** Readable reason, e.g. "需要 dsh ≥ 0.1.7-rc.1，当前是 0.1.5-rc.3". */
   compatNote: string | null
   /** Queued or running `pnpm remove`; the bundle is already off. */
   removing: boolean
+}
+
+/** A published dsh version, and the dist-tag carrying it when there is one. */
+export interface DshSuggestion {
+  version: string
+  tag: string | null
+}
+
+/** A plugin whose declared ranges would not accept a given dsh version. */
+export interface PluginCompatIssue {
+  name: string
+  note: string
 }
 
 /** A version pnpm refused because it was published too recently. */
@@ -182,6 +196,8 @@ export interface ProfileDetail {
   pendingBuilds: string[]
   /** Versions the last pnpm run refused as too new, awaiting trust or time. */
   releaseAgeHolds: ReleaseAgeHold[]
+  /** When plugins reject the active dsh: the newest published dsh that every installed plugin accepts. */
+  dshSuggestion: DshSuggestion | null
 }
 
 export interface PluginUpdate {

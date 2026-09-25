@@ -1,6 +1,7 @@
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
+import { versionHost } from '../src/main/core/compat'
 import { MarketService } from '../src/main/core/market'
 import type { MarketItem, MarketSort } from '../src/shared/types'
 
@@ -28,7 +29,7 @@ describe.skipIf(!enabled)('market ranking on live registry data', () => {
       fetch: (input, init) => fetch(input, init),
       registry: () => 'https://registry.npmjs.org',
       cacheDir: join(root, 'market-cache'),
-      dshVersion: () => DSH_VERSION,
+      dshHost: async () => versionHost(DSH_VERSION),
     })
   })
 
@@ -65,7 +66,7 @@ describe.skipIf(!enabled)('exact package name lookup', () => {
       fetch: (input, init) => fetch(input, init),
       registry: () => 'https://registry.npmjs.org',
       cacheDir: join(root, 'market-cache'),
-      dshVersion: () => DSH_VERSION,
+      dshHost: async () => versionHost(DSH_VERSION),
     })
     const page = await service.search({ query: 'dsh-better-sidebar', sort: 'relevance', from: 0, size: 5, bundlesOnly: false, hideIncompatible: false })
     console.log('results:', page.items.map(item => `${item.name}@${item.version}`))

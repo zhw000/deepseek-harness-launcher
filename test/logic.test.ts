@@ -4,7 +4,8 @@ import { resolveEndpoints } from '../src/main/core/mirrors'
 import { nodeArtifact, parseShasums, pickNodeVersion } from '../src/main/core/node-runtime'
 import { defaultDataRoot, resolveDshHome } from '../src/main/core/paths'
 import { addCommands, explainPnpmFailure, findPluginUpdates, isBuildBlocked, planUpdates, pnpmProgress } from '../src/main/core/plugins'
-import { compatibility, parsePackageSpec, repositoryUrl, resolveVersion, type Packument } from '../src/main/core/registry'
+import { versionHost } from '../src/main/core/compat'
+import { parsePackageSpec, repositoryUrl, resolveVersion, type Packument } from '../src/main/core/registry'
 import type { PluginInfo } from '../src/shared/types'
 import { applySettingsPatch, defaultSettings, normalizeSettings } from '../src/main/core/settings'
 import { splitLaunchArgs } from '../src/main/core/supervisor'
@@ -109,13 +110,6 @@ describe('registry metadata', () => {
     expect(repositoryUrl(undefined)).toBeNull()
   })
 
-  it('checks plugin peer ranges against the dsh version, prereleases included', () => {
-    const peers = { '@deepseek-ai/dsh-settings': '^0.1.0-rc.7 || ^0.1.1-rc.2', '@deepseek-ai/cordis': '^4.0.1' }
-    expect(compatibility(peers, '0.1.5-rc.2').compat).toBe('ok')
-    expect(compatibility({ '@deepseek-ai/dsh-settings': '^0.2.0' }, '0.1.5-rc.2')).toMatchObject({ compat: 'warn' })
-    expect(compatibility({}, '0.1.5-rc.2').compat).toBe('unknown')
-    expect(compatibility(peers, null).compat).toBe('unknown')
-  })
 })
 
 describe('versions', () => {
@@ -241,7 +235,7 @@ describe('plugin update checks', () => {
       plugin('@deepseek-ai/dsh-subagent-codex', '0.1.5-rc.1'),
       plugin('dsh-current', '1.0.0'),
       plugin('dsh-local', '1.0.0', { source: 'git', spec: 'github:u/r' }),
-    ], DSH)
+    ], versionHost(DSH))
     expect(failures).toEqual([])
     expect(updates).toEqual([
       { name: 'dsh-cost-meter', current: '1.7.2', target: '1.7.30', compat: 'ok', compatNote: null },
@@ -250,16 +244,15 @@ describe('plugin update checks', () => {
   })
 
   it('flags an update that no longer supports the running dsh', async () => {
-    const { updates } = await findPluginUpdates(fetchStub, REGISTRY, [plugin('dsh-stale', '1.0.0')], DSH)
-    expect(updates[0]).toMatchObject({ target: '2.0.0', compat: 'warn' })
-    expect(updates[0].compatNote).toContain('^0.2.0')
+    const { updates } = await findPluginUpdates(fetchStub, REGISTRY, [plugin('dsh-stale', '1.0.0')], versionHost(DSH))
+    expect(updates[0]).toMatchObject({ target: '2.0.0', compat: 'warn', compatNote: '需要 dsh ≥ 0.2.0，当前是 0.1.5-rc.2' })
   })
 
   it('reports lookups that failed instead of dropping them', async () => {
     const { updates, failures } = await findPluginUpdates(fetchStub, REGISTRY, [
       plugin('dsh-gone', '1.0.0'),
       plugin('dsh-cost-meter', '1.7.2'),
-    ], DSH)
+    ], versionHost(DSH))
     expect(updates).toHaveLength(1)
     expect(failures).toHaveLength(1)
     expect(failures[0].name).toBe('dsh-gone')

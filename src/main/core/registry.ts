@@ -1,5 +1,4 @@
 import semver from 'semver'
-import type { Compat } from '../../shared/types'
 import { getJson, type FetchFn } from './http'
 
 export interface VersionManifest {
@@ -74,22 +73,6 @@ export function repositoryUrl(repository: VersionManifest['repository']): string
   if (url.startsWith('github:')) url = `https://github.com/${url.slice('github:'.length)}`
   if (/^[\w.-]+\/[\w.-]+$/.test(url)) url = `https://github.com/${url}`
   return /^https?:\/\//.test(url) ? url : null
-}
-
-/**
- * dsh publishes its packages in lockstep, so a plugin's peer ranges on
- * `@deepseek-ai/dsh-*` packages tell whether it targets the running dsh version.
- */
-export function compatibility(peers: Record<string, string> | undefined, dshVersion: string | null): { compat: Compat; note: string | null } {
-  if (dshVersion === null) return { compat: 'unknown', note: null }
-  const relevant = Object.entries(peers ?? {}).filter(([name]) => name.startsWith('@deepseek-ai/dsh'))
-  if (relevant.length === 0) return { compat: 'unknown', note: '未声明兼容的 dsh 版本' }
-  for (const [name, range] of relevant) {
-    if (semver.validRange(range) !== null && !semver.satisfies(dshVersion, range, { includePrerelease: true })) {
-      return { compat: 'warn', note: `${name} 要求 ${range}，当前 dsh 为 ${dshVersion}` }
-    }
-  }
-  return { compat: 'ok', note: null }
 }
 
 export function hasInstallScripts(manifest: VersionManifest): boolean {

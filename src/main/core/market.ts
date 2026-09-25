@@ -2,7 +2,8 @@ import { join } from 'node:path'
 import type { Compat, MarketCategory, MarketItem, MarketLookup, MarketPage, MarketQuery } from '../../shared/types'
 import { getJson, HttpError, type FetchFn } from './http'
 import { SEARCH_ENDPOINT } from './mirrors'
-import { compatibility, fetchManifest, fetchPackument, parsePackageSpec, repositoryUrl } from './registry'
+import { assessCompat, type DshHost } from './compat'
+import { fetchManifest, fetchPackument, parsePackageSpec, repositoryUrl } from './registry'
 import { ensureDir, mapLimit, readJson, writeJsonAtomic } from './util'
 
 /**
@@ -287,8 +288,8 @@ export interface MarketContext {
   fetch: FetchFn
   registry: () => string
   cacheDir: string
-  /** The running dsh version, for compatibility checks. */
-  dshVersion: () => string | null
+  /** The active dsh installation, for compatibility checks. */
+  dshHost: () => Promise<DshHost | null>
 }
 
 export interface RefreshOptions {
@@ -373,9 +374,9 @@ export class MarketService {
     const wanted = query.from + size
     const window = candidates.slice(0, Math.min(candidates.length, Math.min(wanted + 60, 240)))
     const facts = await this.factsFor(window.map(candidate => candidate.entry))
-    const dshVersion = this.context.dshVersion()
+    const host = await this.context.dshHost()
     const detailed = window.map((candidate) => {
-      const item = toItem(candidate.entry, facts.get(candidate.entry.name), dshVersion)
+      const item = toItem(candidate.entry, facts.get(candidate.entry.name), host)
       const score = candidate.score + factsAdjustment(item.name, item.keywords, item.description, item)
       return { item, score }
     })
@@ -510,8 +511,8 @@ export function limitPerPublisher<T extends { entry: IndexEntry }>(candidates: r
   })
 }
 
-function toItem(entry: IndexEntry, facts: PackageFacts | undefined, dshVersion: string | null): MarketItem {
-  const { compat, note } = facts === undefined ? { compat: 'unknown' as Compat, note: null } : compatibility(facts.peers, dshVersion)
+function toItem(entry: IndexEntry, facts: PackageFacts | undefined, host: DshHost | null): MarketItem {
+  const { compat, note } = facts === undefined ? { compat: 'unknown' as Compat, note: null } : assessCompat(facts.peers, host)
   return {
     name: entry.name,
     version: entry.version,

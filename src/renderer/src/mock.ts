@@ -1,6 +1,6 @@
 import type { LauncherBridge } from '../../shared/api'
 import type {
-  AppState, LauncherEvent, LogLine, LogStream, MarketItem, PluginInfo, ProcessStatus, ProfileDetail,
+  AppState, DoctorCheck, LauncherEvent, LogLine, LogStream, MarketItem, PluginInfo, ProcessStatus, ProfileDetail,
   PluginUpdateCheck, ProfileSummary, SettingsPatch, TaskInfo,
 } from '../../shared/types'
 
@@ -21,6 +21,26 @@ const idle = (): ProcessStatus => ({
 })
 
 const newer = (a: string, b: string | null) => b === null || VERSIONS.indexOf(a) < VERSIONS.indexOf(b)
+
+/** Declared dsh ranges of the sample plugins, as bounds, so switching versions re-evaluates them like the service does. */
+const NEEDS: Record<string, { min?: string; below?: string }> = {
+  'dsh-sample-web-all': { min: '0.1.6-alpha.1' },
+  'dsh-sample-legacy': { below: '0.1.3-alpha.1' },
+}
+
+/** What a sample plugin needs that `version` lacks, phrased like the service's `needs`. */
+function needAt(name: string, version: string): string | null {
+  const need = NEEDS[name]
+  if (need?.min !== undefined && newer(need.min, version)) return `需要 dsh ≥ ${need.min}`
+  if (need?.below !== undefined && !newer(need.below, version)) return `只支持 dsh < ${need.below}`
+  return null
+}
+
+/** The same, as a note about the version in use. */
+function compatAt(name: string, version: string): string | null {
+  const need = needAt(name, version)
+  return need === null ? null : `${need}，当前是 ${version}`
+}
 
 function sample(name: string, version: string, description: string, weekly: number, days: number, keywords: string[] = []): MarketItem {
   return {
@@ -106,11 +126,15 @@ export function createMockBridge(): LauncherBridge {
         plugin('@deepseek-ai/dsh-subagent-codex', '0.1.5-rc.1', { spec: '0.1.5-rc.1', description: 'Delegate work to OpenAI Codex as a subagent' }),
         plugin('dsh-sample-cost-meter', '1.7.2', { description: '示例插件：会话费用统计' }),
         plugin('dsh-sample-git-badge', '0.17.4', { spec: 'github:sample/dsh-git-badge', source: 'git', enabled: false, description: 'Sample: git status badges' }),
-        plugin('dsh-sample-legacy', '0.2.0', { compat: 'warn', compatNote: '@deepseek-ai/dsh-settings 要求 ^0.1.0-rc.7 || ^0.1.1-rc.2，当前 dsh 为 0.1.5-rc.1', description: 'Sample: an outdated plugin' }),
+        plugin('dsh-sample-web-all', '0.4.1', { description: '示例插件：整合版 Web 界面，需要较新的 dsh' }),
         plugin('sample-helper-lib', '2.1.0', { bundle: false, enabled: false, description: 'A plain library dependency' }),
       ],
+      dshSuggestion: null,
     },
-    work: { name: 'work', dir: `${HOME}/.dsh/profiles/work`, exists: true, pendingBuilds: [], releaseAgeHolds: [], builtins: [], plugins: [] },
+    work: {
+      name: 'work', dir: `${HOME}/.dsh/profiles/work`, exists: true, pendingBuilds: [], releaseAgeHolds: [], builtins: [], dshSuggestion: null,
+      plugins: [plugin('dsh-sample-legacy', '0.2.0', { description: 'Sample: an outdated plugin' })],
+    },
   }
 
   const refresh = () => {
@@ -148,7 +172,20 @@ export function createMockBridge(): LauncherBridge {
     refresh()
   }
   const detail = (name: string) => profiles[name]
-    ?? (profiles[name] = { name, dir: `${HOME}/.dsh/profiles/${name}`, exists: false, pendingBuilds: [], releaseAgeHolds: [], builtins: [], plugins: [] })
+    ?? (profiles[name] = { name, dir: `${HOME}/.dsh/profiles/${name}`, exists: false, pendingBuilds: [], releaseAgeHolds: [], builtins: [], plugins: [], dshSuggestion: null })
+  /** A profile as the service reports it: compatibility against the active dsh, and an upgrade that satisfies every plugin. */
+  const assessed = (name: string): ProfileDetail => {
+    const active = state.settings.activeVersion ?? VERSIONS[0]
+    const current = detail(name)
+    const plugins = current.plugins.map((item) => {
+      const note = compatAt(item.name, active)
+      return note === null ? item : { ...item, compat: 'warn' as const, compatNote: note }
+    })
+    const rejected = plugins.some(item => item.compat === 'warn' && NEEDS[item.name] !== undefined)
+    const version = rejected ? VERSIONS.find(candidate => newer(candidate, active) && plugins.every(item => compatAt(item.name, candidate) === null)) : undefined
+    const tag = Object.entries(state.remote?.distTags ?? {}).find(([, tagged]) => tagged === version)?.[0] ?? null
+    return { ...current, plugins, dshSuggestion: version === undefined ? null : { version, tag } }
+  }
 
   const bridge: LauncherBridge = {
     getState: async () => {
@@ -233,7 +270,14 @@ export function createMockBridge(): LauncherBridge {
       detail(name).exists = true
       emit({ type: 'plugins-changed', profile: name })
     },
-    getProfile: async name => clone(detail(name)),
+    getProfile: async name => clone(assessed(name)),
+    checkPluginCompat: async (name, version) => {
+      await wait(200)
+      return detail(name).plugins.flatMap((item) => {
+        const note = needAt(item.name, version)
+        return note === null ? [] : [{ name: item.name, note }]
+      })
+    },
     checkPluginUpdates: async (name): Promise<PluginUpdateCheck> => {
       await wait(600)
       const targets: Record<string, string> = { 'dsh-sample-cost-meter': '1.7.30', '@deepseek-ai/dsh-subagent-codex': state.settings.activeVersion ?? '' }
@@ -335,9 +379,10 @@ export function createMockBridge(): LauncherBridge {
     previewPackage: async (spec) => {
       await wait(400)
       const found = MARKET.find(item => item.name === spec)
+      const note = compatAt(spec, state.settings.activeVersion ?? VERSIONS[0])
       return {
         name: spec, version: found?.version ?? '1.0.0', description: found?.description ?? '', license: 'MIT', homepage: null,
-        bundle: !spec.includes('lib'), compat: 'ok', compatNote: null, installScripts: spec.includes('native'), deprecated: null, migrateTo: null,
+        bundle: !spec.includes('lib'), compat: note === null ? 'ok' : 'warn', compatNote: note, installScripts: spec.includes('native'), deprecated: null, migrateTo: null,
       }
     },
     checkLauncherUpdate: async () => {
@@ -346,6 +391,19 @@ export function createMockBridge(): LauncherBridge {
     },
     runDoctor: async () => {
       await wait(900)
+      const launch = assessed(state.settings.launch.profile)
+      const rejecting = launch.plugins.filter(item => item.compat === 'warn')
+      const suggestion = launch.dshSuggestion
+      const compat: DoctorCheck = rejecting.length === 0
+        ? { id: 'compat', title: '插件兼容性', status: 'ok', detail: `声明了版本范围的插件都兼容 dsh ${state.settings.activeVersion}`, fix: null }
+        : {
+            id: 'compat',
+            title: '插件兼容性',
+            status: 'warn',
+            detail: rejecting.map(item => `${item.name} ${item.compatNote}`).join('；')
+              + (suggestion === null ? '' : `。切换到 dsh ${suggestion.version}${suggestion.tag === null ? '' : `（${suggestion.tag}）`}可以让已装插件都满足要求`),
+            fix: suggestion === null ? 'plugins' : 'versions',
+          }
       return {
         checkedAt: now(),
         launcherVersion: state.launcherVersion,
@@ -359,9 +417,10 @@ export function createMockBridge(): LauncherBridge {
           { id: 'dsh-home', title: 'DSH_HOME', status: 'ok', detail: `${HOME}/.dsh`, fix: null },
           { id: 'workspace', title: '工作区', status: 'ok', detail: `${HOME}/dsh-workspace`, fix: null },
           { id: 'port', title: '启动端口', status: 'ok', detail: '3080 空闲', fix: null },
-          { id: 'profile', title: '启动配置', status: 'ok', detail: 'web（5 个插件）', fix: null },
+          { id: 'profile', title: '启动配置', status: 'ok', detail: `${launch.name}（${launch.plugins.length} 个插件）`, fix: null },
           { id: 'builds', title: '构建脚本', status: 'ok', detail: '没有待决定的构建脚本', fix: null },
-          { id: 'plugins', title: '插件状态', status: 'warn', detail: '声明的版本范围不含当前 dsh：dsh-sample-legacy', fix: 'plugins' },
+          { id: 'plugins', title: '插件文件', status: 'ok', detail: `${launch.plugins.length} 个插件的文件都在`, fix: null },
+          compat,
         ],
       }
     },

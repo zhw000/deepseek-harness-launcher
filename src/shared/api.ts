@@ -1,7 +1,7 @@
 import type {
   AppState, LauncherEvent, LogLine, MarketPage, PackagePreview, PluginUpdate,
   ProfileDetail, ProfileSummary, SettingsPatch, PluginUpdateCheck, MarketQuery,
-  DoctorReport, ImportResult, LauncherRelease, MirrorTiming,
+  DoctorReport, ImportResult, LauncherRelease, MirrorTiming, PluginCompatIssue,
 } from './types'
 
 export type OpenTarget = 'root' | 'dshHome' | 'dshLogs' | 'logs' | 'workspace' | 'profile'
@@ -38,6 +38,8 @@ export interface LauncherApi {
   decideBuilds(profile: string, names: string[], allow: boolean): Promise<void>
   /** Exempt the versions pnpm held back as too new, then retry the blocked operation. */
   trustReleaseAge(profile: string): Promise<void>
+  /** Installed plugins of a profile that would reject the given dsh version. */
+  checkPluginCompat(profile: string, version: string): Promise<PluginCompatIssue[]>
 
   searchMarket(query: MarketQuery): Promise<MarketPage>
   /** Rebuild the local plugin index from the registry. */
@@ -71,7 +73,7 @@ export const API_METHODS = [
   'setup', 'checkUpdates', 'installVersion', 'activateVersion', 'removeVersion', 'getReleaseNotes',
   'start', 'stop', 'restart', 'openWebUI',
   'listProfiles', 'createProfile', 'getProfile', 'checkPluginUpdates', 'installPlugin', 'removePlugin',
-  'updatePlugins', 'setBundleEnabled', 'decideBuilds', 'trustReleaseAge',
+  'updatePlugins', 'setBundleEnabled', 'decideBuilds', 'trustReleaseAge', 'checkPluginCompat',
   'searchMarket', 'refreshMarketIndex', 'previewPackage',
   'checkLauncherUpdate', 'runDoctor', 'testMirrors', 'exportPlugins', 'importPlugins',
   'updateSettings', 'cancelTask', 'pickDirectory', 'pickFile', 'openPath', 'openExternal',

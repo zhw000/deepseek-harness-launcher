@@ -1,12 +1,13 @@
 import { stat } from 'node:fs/promises'
-import { isAbsolute } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import semver from 'semver'
 import type { Channel, PackagePreview, PluginInfo, PluginUpdate, PluginUpdateCheck, ReleaseAgeHold } from '../../shared/types'
+import { assessCompat, type DshHost } from './compat'
 import type { FetchFn } from './http'
 import {
-  compatibility, fetchManifest, fetchPackument, hasInstallScripts, parsePackageSpec, repositoryUrl, resolveVersion,
+  fetchManifest, fetchPackument, hasInstallScripts, parsePackageSpec, repositoryUrl, resolveVersion, type VersionManifest,
 } from './registry'
-import { mapLimit } from './util'
+import { mapLimit, readJson } from './util'
 
 export const OFFICIAL_SCOPE = '@deepseek-ai/'
 
@@ -63,8 +64,9 @@ export async function planInstall(fetchFn: FetchFn, registry: string, input: str
  * rather than silently dropped.
  */
 export async function findPluginUpdates(
-  fetchFn: FetchFn, registry: string, plugins: readonly PluginInfo[], dshVersion: string | null, signal?: AbortSignal,
+  fetchFn: FetchFn, registry: string, plugins: readonly PluginInfo[], host: DshHost | null, signal?: AbortSignal,
 ): Promise<PluginUpdateCheck> {
+  const dshVersion = host?.version ?? null
   const candidates = plugins.filter(plugin => plugin.source === 'registry' && plugin.version !== null && semver.valid(plugin.version) !== null)
   const failures: PluginUpdateCheck['failures'] = []
   const results = await mapLimit(candidates, 6, async (plugin): Promise<PluginUpdate | null> => {
@@ -74,7 +76,7 @@ export async function findPluginUpdates(
         ? dshVersion
         : packument['dist-tags'].latest
       if (target === undefined || !semver.gt(target, plugin.version!)) return null
-      const { compat, note } = compatibility(packument.versions[target]?.peerDependencies, dshVersion)
+      const { compat, note } = assessCompat(packument.versions[target]?.peerDependencies, host)
       return { name: plugin.name, current: plugin.version, target, compat, compatNote: note }
     } catch (error) {
       failures.push({ name: plugin.name, error: error instanceof Error ? error.message : String(error) })
@@ -89,20 +91,41 @@ export function planUpdates(updates: readonly PluginUpdate[]): string[][] {
   return addCommands(updates.map(update => ({ spec: `${update.name}@${update.target}`, exact: update.name.startsWith(OFFICIAL_SCOPE) })))
 }
 
-/** Look a registry package up before installing: bundle declaration, compatibility and install scripts. */
+/** The folder behind a local directory spec — an absolute path, or a `link:`/`file:` one — or null. */
+async function localPackageDir(spec: string): Promise<string | null> {
+  const path = spec.trim().replace(/^(link|file):/i, '')
+  if (!isAbsolute(path)) return null
+  const info = await stat(path).catch(() => null)
+  return info?.isDirectory() === true ? path : null
+}
+
+/**
+ * Look a package up before installing: bundle declaration, compatibility and install scripts.
+ * Registry packages come from the registry; a local plugin folder is read from disk.
+ */
 export async function previewPackage(
-  fetchFn: FetchFn, registry: string, spec: string, dshVersion: string | null, signal?: AbortSignal,
+  fetchFn: FetchFn, registry: string, spec: string, host: DshHost | null, signal?: AbortSignal,
 ): Promise<PackagePreview> {
+  const local = await localPackageDir(spec)
+  if (local !== null) {
+    const manifest = await readJson<VersionManifest>(join(local, 'package.json')).catch(() => null)
+    if (manifest === null) throw new Error(`${local} 里没有 package.json`)
+    return toPreview(manifest, host)
+  }
   const parsed = parsePackageSpec(spec)
-  if (parsed === null) throw new Error('只能预览 npm 包（例如 dsh-cost-meter 或 @scope/name@1.2.3）')
+  if (parsed === null) throw new Error('只能预览 npm 包或本地插件目录（例如 dsh-cost-meter 或 @scope/name@1.2.3）')
+  const dshVersion = host?.version ?? null
   const packument = await fetchPackument(fetchFn, registry, parsed.name, { signal })
   const official = parsed.name.startsWith(OFFICIAL_SCOPE)
   const version = official && parsed.range === null && dshVersion !== null && packument.versions[dshVersion] !== undefined
     ? dshVersion
     : resolveVersion(packument, parsed.range)
   if (version === null) throw new Error(`${spec} 没有匹配的版本`)
-  const manifest = await fetchManifest(fetchFn, registry, parsed.name, version, signal)
-  const { compat, note } = compatibility(manifest.peerDependencies, dshVersion)
+  return toPreview(await fetchManifest(fetchFn, registry, parsed.name, version, signal), host)
+}
+
+function toPreview(manifest: VersionManifest, host: DshHost | null): PackagePreview {
+  const { compat, note } = assessCompat(manifest.peerDependencies, host)
   return {
     name: manifest.name,
     version: manifest.version,

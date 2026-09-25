@@ -4,8 +4,9 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { versionHost } from '../src/main/core/compat'
 import {
-  classifySpec, decideBuilds, isWebProfile, listProfiles, readPendingBuilds, readProfileDetail, setBundleEnabled,
+  classifySpec, decideBuilds, isWebProfile, listProfiles, profileCompatIssues, readPendingBuilds, readProfileDetail, setBundleEnabled,
   validateProfileName, withProfileLock,
 } from '../src/main/core/profiles'
 
@@ -129,7 +130,7 @@ describe('plugin inventory', () => {
       'node_modules/dsh-git/package.json': manifest({ name: 'dsh-git', version: '0.0.1', dsh: { bundle: { patch: 'p.yml' } } }),
     })
     const detail = await readProfileDetail(home, 'work', {
-      dshVersion: '0.1.5-rc.2',
+      host: versionHost('0.1.5-rc.2'),
       installation: [
         { name: BASE, description: 'base' },
         { name: WEB, description: 'web' },
@@ -149,6 +150,33 @@ describe('plugin inventory', () => {
       { name: WEB, description: 'web', enabled: true, optional: false },
       { name: '@deepseek-ai/dsh-experimental-agent-team-profile', description: 'team', enabled: false, optional: true },
     ])
+  })
+
+  it('says which dsh each plugin needs, and which published dsh satisfies them all', async () => {
+    const manifest = (value: object) => JSON.stringify(value)
+    await writeProfile('compat', {
+      dependencies: { '@linxin666/dsh-web-all': '^0.4.1', 'dsh-agent-board': '^1.0.0' },
+      dsh: { profile: { bundles: [BASE, WEB] } },
+    }, {
+      'node_modules/@linxin666/dsh-web-all/package.json': manifest({ name: '@linxin666/dsh-web-all', version: '0.4.1', peerDependencies: { '@deepseek-ai/dsh': '>=0.1.7-rc.1' } }),
+      'node_modules/dsh-agent-board/package.json': manifest({ name: 'dsh-agent-board', version: '1.0.0', peerDependencies: { '@deepseek-ai/dsh': '>=0.1.5-rc.1 <0.2.0-0' } }),
+    })
+    const detail = await readProfileDetail(home, 'compat', {
+      host: versionHost('0.1.5-rc.3'),
+      installation: [],
+      published: { versions: ['0.2.0-alpha.1', '0.1.7-rc.1', '0.1.5-rc.3'], tags: { latest: '0.1.5-rc.3', next: '0.1.7-rc.1' } },
+    })
+    expect(detail.plugins.find(plugin => plugin.name === '@linxin666/dsh-web-all'))
+      .toMatchObject({ compat: 'warn', compatNote: '需要 dsh ≥ 0.1.7-rc.1，当前是 0.1.5-rc.3' })
+    expect(detail.plugins.find(plugin => plugin.name === 'dsh-agent-board')?.compat).toBe('ok')
+    // 0.2.0-alpha.1 would break the board, so the next channel's 0.1.7-rc.1 is the one to move to.
+    expect(detail.dshSuggestion).toEqual({ version: '0.1.7-rc.1', tag: 'next' })
+
+    // Before switching back to an older dsh, the same plugins say what they would need.
+    expect(await profileCompatIssues(home, 'compat', versionHost('0.1.5-rc.3'))).toEqual([
+      { name: '@linxin666/dsh-web-all', note: '需要 dsh ≥ 0.1.7-rc.1' },
+    ])
+    expect(await profileCompatIssues(home, 'compat', versionHost('0.1.7-rc.1'))).toEqual([])
   })
 
   it('classifies dependency specs', () => {

@@ -40,10 +40,24 @@ function CreateProfile({ onClose, onCreated }: { onClose: () => void; onCreated:
 function InstallBar({ profile }: { profile: string }) {
   const [spec, setSpec] = useState('')
   const [busy, run] = useAction()
+  const [checking, setChecking] = useState(false)
   const install = async (value: string) => {
     const target = value.trim()
     if (!target) return
-    const ok = await store.ask({ title: `安装 ${target}？`, message: `安装到配置 ${profile}。\n\n${TRUST_NOTE}`, confirmText: '安装' })
+    // Hold the version that would be installed against the active dsh first. Git repos, tarballs
+    // and an unreachable registry just skip the check.
+    setChecking(true)
+    const preview = await api.previewPackage(target).catch(() => null)
+    setChecking(false)
+    const clash = preview?.compat === 'warn' ? preview : null
+    const ok = await store.ask(clash === null
+      ? { title: `安装 ${target}？`, message: `安装到配置 ${profile}。\n\n${TRUST_NOTE}`, confirmText: '安装' }
+      : {
+          title: `${clash.name} ${clash.version} 不支持当前的 dsh`,
+          message: `${clash.compatNote}。\n\n装上后多半会在浏览器里报错。可以先到「版本」页换一个满足要求的 dsh，或者仍然安装到配置 ${profile}。\n\n${TRUST_NOTE}`,
+          confirmText: '仍然安装',
+          danger: true,
+        })
     if (ok && await run(async () => { await api.installPlugin(profile, target); return true }, `已安装 ${target}`)) setSpec('')
   }
   const pick = (picker: () => Promise<string | null>) => void attempt(async () => {
@@ -57,9 +71,9 @@ function InstallBar({ profile }: { profile: string }) {
       <div className="row">
         <input className="input mono grow" value={spec} placeholder="例如 dsh-cost-meter 或 github:user/dsh-plugin" spellCheck={false}
           onChange={event => setSpec(event.target.value)} onKeyDown={event => event.key === 'Enter' && void install(spec)} />
-        <button type="button" className="btn primary" disabled={busy || !spec.trim()} onClick={() => void install(spec)}>{busy ? <Spinner /> : <PackagePlus size={15} />}安装</button>
-        <button type="button" className="btn" disabled={busy} onClick={() => pick(() => api.pickDirectory())}>本地目录…</button>
-        <button type="button" className="btn" disabled={busy} onClick={() => pick(() => api.pickFile())}>压缩包…</button>
+        <button type="button" className="btn primary" disabled={busy || checking || !spec.trim()} onClick={() => void install(spec)}>{busy || checking ? <Spinner /> : <PackagePlus size={15} />}安装</button>
+        <button type="button" className="btn" disabled={busy || checking} onClick={() => pick(() => api.pickDirectory())}>本地目录…</button>
+        <button type="button" className="btn" disabled={busy || checking} onClick={() => pick(() => api.pickFile())}>压缩包…</button>
       </div>
     </div>
   )
@@ -85,14 +99,15 @@ function PluginRow({ plugin, update, busy, onToggle, onUpdate, onRemove }: {
           {plugin.source !== 'registry' && <span className="badge">{SOURCES[plugin.source]}</span>}
           {plugin.version === null && <span className="badge danger">文件缺失</span>}
           {plugin.removing && <span className="badge"><Spinner size={11} />卸载中</span>}
-          {plugin.compat === 'warn' && <span className="badge warning" title={plugin.compatNote ?? ''}><TriangleAlert size={12} />可能不兼容</span>}
+          {plugin.compat === 'warn' && <span className="badge warning"><TriangleAlert size={12} />不兼容</span>}
           {update && (
           <span className={`badge ${update.compat === 'warn' ? 'warning' : 'success'}`} title={update.compatNote ?? undefined}>
             <CircleArrowUp size={12} />{update.target}
           </span>
         )}
         </div>
-        <div className="faint ellipsis" title={plugin.compatNote ?? plugin.description}>{plugin.description || plugin.spec}</div>
+        <div className="faint ellipsis" title={plugin.description}>{plugin.description || plugin.spec}</div>
+        {plugin.compat === 'warn' && <div className="compat-note">{plugin.compatNote}</div>}
       </div>
       {update && <button type="button" className="btn sm" disabled={busy} onClick={onUpdate}>更新</button>}
       {plugin.homepage && (
@@ -143,6 +158,8 @@ export function PluginsPage() {
   }
 
   const plugins = detail?.plugins ?? []
+  const incompatible = plugins.filter(plugin => plugin.compat === 'warn')
+  const suggestion = detail?.dshSuggestion ?? null
   const running = state.process.phase === 'running' && state.process.profile === profile
   const updateFor = (name: string) => check?.updates.find(update => update.name === name)
   const checkUpdates = () => void runCheck(async () => {
@@ -232,6 +249,16 @@ export function PluginsPage() {
             </>
           )}>
             pnpm 拒绝运行这些依赖的构建脚本：<b className="mono">{detail.pendingBuilds.join('、')}</b>。在做出选择前，这个配置下的所有安装都会失败。
+          </Banner>
+        )}
+        {incompatible.length > 0 && (
+          <Banner level="warning" action={suggestion !== null
+            ? <button type="button" className="btn sm" onClick={() => navigate('versions')}>去切换版本</button>
+            : <button type="button" className="btn sm" disabled={checking} onClick={checkUpdates}>检查插件更新</button>}>
+            {incompatible.length} 个插件不支持当前的 dsh {activeVersion}，启动后可能在浏览器里报错。
+            {suggestion !== null
+              ? `换到 dsh ${suggestion.version}${suggestion.tag === null ? '' : `（${suggestion.tag} 通道）`}可以让全部插件都满足要求。`
+              : '可以检查插件更新，或者停用、卸载不再维护的插件。'}
           </Banner>
         )}
         {check !== null && check.failures.length > 0 && (

@@ -324,6 +324,7 @@ code, .mono { font-family: var(--mono); font-size: 12.5px; }
 .plugin-icon.official { background: var(--accent-soft); color: var(--accent-text); border-color: transparent; }
 .plugin-icon.builtin { background: transparent; }
 .switch-slot { width: 38px; flex: none; }
+.compat-note { color: var(--warning); font-size: 12.5px; margin-top: 2px; word-break: break-word; }
 .empty p { margin: 6px 0 14px; }
 .market-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 12px; }
 .market-card { padding: 16px; display: flex; flex-direction: column; gap: 8px; min-height: 176px; }

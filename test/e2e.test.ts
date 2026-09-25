@@ -123,6 +123,24 @@ describe.skipIf(!enabled)('end to end against npm and a real dsh', () => {
     }
   }, 10 * MINUTE)
 
+  it('checks plugins against the dsh they run on, and against a version before switching to it', async () => {
+    await service.installPlugin(PROFILE, PLUGIN)
+    try {
+      // Its peers pin the exact cordis this dsh ships and ^dsh on its lockstep packages: all hold.
+      expect((await service.getProfile(PROFILE)).plugins.find(item => item.name === PLUGIN)).toMatchObject({ compat: 'ok', compatNote: null })
+      const report = await service.runDoctor()
+      expect(report.checks.find(check => check.id === 'compat')).toMatchObject({ status: 'ok' })
+      // An older dsh would not do, and the note says which dsh it needs.
+      const issues = await service.checkPluginCompat(PROFILE, '0.1.0')
+      expect(issues).toHaveLength(1)
+      expect(issues[0]).toMatchObject({ name: PLUGIN })
+      expect(issues[0].note).toMatch(/^需要 dsh ≥ 0\.\d+\.\d+/)
+    } finally {
+      await service.removePlugin(PROFILE, PLUGIN)
+      await service.whenIdle()
+    }
+  }, 10 * MINUTE)
+
   it('exports a plugin list and restores it into another profile in one pnpm run', async () => {
     const seeds = ['dsh-whale-widget', 'dsh-neu-theme']
     await Promise.all(seeds.map(spec => service.installPlugin(PROFILE, spec)))

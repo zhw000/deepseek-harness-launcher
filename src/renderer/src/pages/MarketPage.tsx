@@ -69,8 +69,10 @@ function InstallDialog({ spec, profile, onClose }: { spec: string; profile: stri
               ? <CheckItem tone="ok">声明了 <code>dsh.bundle</code>，安装后会作为组合包启用</CheckItem>
               : <CheckItem tone="warn">没有声明 <code>dsh.bundle</code>：只会作为普通依赖安装，dsh 不会加载它</CheckItem>}
             {preview.compat === 'ok' && <CheckItem tone="ok">声明的版本范围兼容当前 dsh</CheckItem>}
-            {preview.compat === 'warn' && <CheckItem tone="warn">可能不兼容：{preview.compatNote}</CheckItem>}
-            {preview.compat === 'unknown' && <CheckItem tone="info">没有声明兼容的 dsh 版本，安装后请留意启动日志</CheckItem>}
+            {preview.compat === 'warn' && <CheckItem tone="warn">不支持当前的 dsh：{preview.compatNote}</CheckItem>}
+            {preview.compat === 'unknown' && (
+              <CheckItem tone="info">{preview.compatNote === null ? '无法核对与当前 dsh 的兼容性' : '没有声明兼容的 dsh 版本'}，安装后请留意启动日志</CheckItem>
+            )}
             {preview.installScripts && <CheckItem tone="warn">包含安装脚本。pnpm 会先拦截，需要你确认后才会运行</CheckItem>}
             {preview.migrateTo !== null && (
               <CheckItem tone="warn">作者已把它迁移到 <b className="mono">{preview.migrateTo}</b>，建议改装那个包</CheckItem>
@@ -89,7 +91,7 @@ function Flags({ item }: { item: MarketItem }) {
     <>
       {item.official && <span className="badge accent">官方</span>}
       {item.bundle === false && <span className="badge warning" title="没有声明 dsh.bundle，安装后 dsh 不会加载它">非组合包</span>}
-      {item.compat === 'warn' && <span className="badge warning" title={item.compatNote ?? ''}><TriangleAlert size={11} />可能不兼容</span>}
+      {item.compat === 'warn' && <span className="badge warning" title={item.compatNote ?? ''}><TriangleAlert size={11} />不兼容</span>}
       {item.deprecated !== null && <span className="badge danger" title={item.deprecated}>已弃用</span>}
     </>
   )
